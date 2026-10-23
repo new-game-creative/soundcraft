@@ -89,6 +89,21 @@ pub fn session(e: &Engine, full: bool) -> Value {
         "zoom": {"samples_per_px": s.edit.zoom.samples_per_px, "scroll": s.edit.zoom.scroll},
         "transport": e.transport,
         "undo": e.undo_label(), "redo": e.redo_label(),
+        "launcher": launcher_json(s),
+    })
+}
+
+/// The clip launcher: scenes, quantize, and each track's filled slots.
+fn launcher_json(s: &soundcraft_model::Session) -> Value {
+    let l = &s.launcher;
+    json!({
+        "quantize_bars": l.quantize_bars,
+        "scenes": l.scenes.iter().map(|x| x.name.clone()).collect::<Vec<_>>(),
+        "slots": l.rows.iter().flat_map(|r| r.slots.iter().enumerate().filter_map(move |(scene, slot)| slot.as_ref().map(|x| json!({
+            "track": r.track, "scene": scene, "clip": x.clip.id, "name": x.clip.name, "length": x.clip.length,
+            "loop_ticks": x.loop_ticks, "looped": x.looped, "gain_db": x.clip.gain_db,
+            "offset": match x.clip.content { soundcraft_model::ClipContent::Audio { offset, .. } => Some(offset), _ => None },
+        })))).collect::<Vec<_>>(),
     })
 }
 
