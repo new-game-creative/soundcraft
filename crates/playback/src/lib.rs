@@ -101,6 +101,34 @@ enum Cmd {
     },
     Stop,
     Locate(Samples),
+    /// Launch `scene` on `track` (or stop it, `None`) at the next multiple of `quantize_bars`.
+    Launch {
+        track: TrackId,
+        scene: Option<usize>,
+        quantize_bars: f64,
+    },
+    /// Tracks play their launched slots (on) or the timeline (off).
+    SessionMode(bool),
+}
+
+/// What the clip launcher is playing and has queued, for the UI.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LaunchStatus {
+    pub session_mode: bool,
+    /// (track, scene, start sample) of every playing slot.
+    pub playing: Vec<(TrackId, usize, Samples)>,
+    /// (track, scene or `None` to stop, sample it happens at) of every queued change.
+    pub queued: Vec<(TrackId, Option<usize>, Samples)>,
+}
+
+/// Most launches the audio thread keeps without allocating (one per track and a queued change).
+const LAUNCH_CAPACITY: usize = 256;
+
+impl LaunchStatus {
+    /// Sized so the audio thread's copies into it never allocate.
+    fn reserved() -> Self {
+        LaunchStatus { session_mode: false, playing: Vec::with_capacity(LAUNCH_CAPACITY), queued: Vec::with_capacity(LAUNCH_CAPACITY) }
+    }
 }
 
 struct Shared {
@@ -109,6 +137,7 @@ struct Shared {
     /// Speed × 1000.
     speed: AtomicU32,
     meters: Mutex<MeterSnapshot>,
+    launch: Mutex<LaunchStatus>,
 }
 
 /// What stopped the audio output.
@@ -202,6 +231,8 @@ struct AudioState {
     old_sessions: Option<SyncSender<Arc<Session>>>,
     /// Loudness of the main mix, sized to its channels (rebuilt only when the format changes).
     loudness: LoudnessMeter,
+    /// Launcher changes waiting for their quantise boundary: (track, scene or stop, sample).
+    launch_queue: Vec<(TrackId, Option<usize>, Samples)>,
 }
 
 fn new_engine(sr: f32) -> MixEngine {
@@ -234,6 +265,59 @@ impl AudioState {
             input: None,
             recording: false,
             loudness: LoudnessMeter::new(sr, nch),
+            launch_queue: Vec::with_capacity(LAUNCH_CAPACITY),
+        }
+        .with_launch_capacity()
+    }
+
+    fn with_launch_capacity(mut self) -> Self {
+        self.mix.launch.playing.reserve(LAUNCH_CAPACITY);
+        self
+    }
+
+    /// The first sample at or after `pos` on a multiple of `quantize_bars` bars (from bar 1).
+    fn launch_time(&self, quantize_bars: f64) -> Samples {
+        let s = &self.session;
+        let sr = s.sample_rate;
+        let tick = s.tempo.samples_to_ticks(self.pos, sr);
+        let q = (quantize_bars * s.tempo.meter_at_tick(tick).ticks_per_bar() as f64).round() as i64;
+        if q <= 0 || !self.playing {
+            return self.pos;
+        }
+        let next = tick.div_euclid(q).saturating_add(i64::from(tick.rem_euclid(q) != 0)).saturating_mul(q);
+        s.tempo.tick_to_samples(next, sr).max(self.pos)
+    }
+
+    /// Applies the queued launches due by `pos`, and returns how many frames may render before
+    /// the next one (so each lands on its sample).
+    fn run_launch_queue(&mut self, n: usize) -> usize {
+        let pos = self.pos;
+        let mut changed = false;
+        let mut i = 0;
+        while let Some(&(track, scene, at)) = self.launch_queue.get(i) {
+            if at <= pos {
+                self.mix.launch.set(track, scene, pos);
+                self.launch_queue.swap_remove(i);
+                changed = true;
+            } else {
+                i += 1;
+            }
+        }
+        if changed {
+            self.publish_launch();
+        }
+        let next = self.launch_queue.iter().map(|(_, _, at)| *at).min();
+        next.map_or(n, |at| n.min(usize::try_from(at - pos).unwrap_or(n).max(1)))
+    }
+
+    /// Copies the launcher state for the UI (without allocating once the lists are sized).
+    fn publish_launch(&self) {
+        if let Ok(mut st) = self.shared.launch.try_lock() {
+            st.session_mode = self.mix.launch.session_mode;
+            st.playing.clear();
+            st.playing.extend_from_slice(&self.mix.launch.playing);
+            st.queued.clear();
+            st.queued.extend_from_slice(&self.launch_queue);
         }
     }
 
@@ -285,6 +369,27 @@ impl AudioState {
                     self.end = None;
                     self.looped = None;
                     self.mix.reset();
+                    // Stopping the transport stops every launched slot.
+                    self.mix.launch.playing.clear();
+                    self.launch_queue.clear();
+                    self.publish_launch();
+                }
+                Cmd::Launch { track, scene, quantize_bars } => {
+                    let at = self.launch_time(quantize_bars);
+                    self.launch_queue.retain(|(t, _, _)| *t != track);
+                    if self.launch_queue.len() < LAUNCH_CAPACITY {
+                        self.launch_queue.push((track, scene, at));
+                    }
+                    self.mix.launch.session_mode = true;
+                    self.publish_launch();
+                }
+                Cmd::SessionMode(on) => {
+                    self.mix.launch.session_mode = on;
+                    if !on {
+                        self.mix.launch.playing.clear();
+                        self.launch_queue.clear();
+                    }
+                    self.publish_launch();
                 }
                 Cmd::Locate(at) => {
                     self.pos = at;
@@ -336,6 +441,10 @@ impl AudioState {
             }
             self.pending_len = BLOCK;
             return;
+        }
+        if self.playing {
+            // Launches start exactly on their sample: the block ends at the next one.
+            n = self.run_launch_queue(n);
         }
         if let Some(ring) = &self.input {
             let ch = ring.channels.load(Ordering::Relaxed).max(1);
@@ -559,6 +668,7 @@ impl Player {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            launch: Mutex::new(LaunchStatus::reserved()),
         });
         let want = session.sample_rate.hz();
         let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
@@ -812,6 +922,24 @@ impl Player {
     pub fn locate(&self, at: Samples) {
         self.shared.position.store(at, Ordering::Relaxed);
         let _ = self.tx.send(Cmd::Locate(at));
+    }
+
+    /// Launches `scene` on `track` (stops it with `None`) at the next multiple of `quantize_bars`
+    /// bars, sample-accurately, and switches the tracks to their launched slots (session mode).
+    /// Start the transport first if it is stopped: the launch then begins at once.
+    pub fn launch(&self, track: TrackId, scene: Option<usize>, quantize_bars: f64) {
+        let quantize_bars = if quantize_bars.is_finite() { quantize_bars.clamp(0.0, 16.0) } else { 1.0 };
+        let _ = self.tx.send(Cmd::Launch { track, scene, quantize_bars });
+    }
+
+    /// Tracks play their launched slots (on) or the timeline (off, which stops every slot).
+    pub fn set_session_mode(&self, on: bool) {
+        let _ = self.tx.send(Cmd::SessionMode(on));
+    }
+
+    /// What the launcher is playing and has queued.
+    pub fn launch_status(&self) -> LaunchStatus {
+        self.shared.launch.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     pub fn set_speed(&self, speed: f32) {
@@ -1162,6 +1290,7 @@ mod tests {
             playing: AtomicBool::new(true),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            launch: Mutex::new(LaunchStatus::reserved()),
         };
         let fault = Fault::default();
         let mut out = [0.5f32; 8];
@@ -1203,6 +1332,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            launch: Mutex::new(LaunchStatus::reserved()),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -1221,6 +1351,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            launch: Mutex::new(LaunchStatus::reserved()),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -1245,11 +1376,61 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            launch: Mutex::new(LaunchStatus::reserved()),
         });
         let (tx, rx) = channel();
         let st = AudioState::new(rx, shared, Arc::new(s), 48_000.0, channel().0);
         tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
         st
+    }
+
+    #[test]
+    fn a_launch_lands_exactly_on_the_next_quantise_boundary() {
+        use soundcraft_model::{ChannelFormat, Clip, LaunchSlot, SourceAudio, SourceId, TrackKind};
+        // 120 BPM 4/4 at 48 kHz: bar 2 starts at sample 96 000.
+        let mut s = Session::default();
+        s.edit.click = false;
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        s.pool.insert(
+            SourceId(5),
+            Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.5; 96_000]] })),
+        );
+        s.launcher.insert_scene(0, "A".into());
+        let id = s.new_clip_id();
+        s.launcher.set_slot(t, 0, Some(LaunchSlot::new(Clip::audio(id, "loop", SourceId(5), 0, 0, 96_000), 3840))).unwrap();
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+            launch: Mutex::new(LaunchStatus::reserved()),
+        });
+        let (tx, rx) = channel();
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        let mut out = vec![0.0f32; 2 * 500];
+        let mut played = Vec::new();
+        st.fill(&mut out, 2);
+        played.extend(out.iter().step_by(2).copied());
+        // Launched a little into bar 1: queued for bar 2.
+        tx.send(Cmd::Launch { track: t, scene: Some(0), quantize_bars: 1.0 }).unwrap();
+        st.fill(&mut out, 2);
+        played.extend(out.iter().step_by(2).copied());
+        let status = shared.launch.lock().unwrap().clone();
+        assert!(status.session_mode);
+        assert_eq!(status.queued, vec![(t, Some(0), 96_000)]);
+        while played.len() < 100_000 {
+            st.fill(&mut out, 2);
+            played.extend(out.iter().step_by(2).copied());
+        }
+        let first = played.iter().position(|x| x.abs() > 1e-6);
+        assert_eq!(first, Some(96_000), "starts on the bar line, to the sample");
+        let status = shared.launch.lock().unwrap().clone();
+        assert_eq!((status.playing, status.queued.len()), (vec![(t, 0, 96_000)], 0));
+        // Stopping the transport stops the slot.
+        tx.send(Cmd::Stop).unwrap();
+        st.fill(&mut out, 2);
+        assert!(shared.launch.lock().unwrap().playing.is_empty());
     }
 
     #[test]
@@ -1271,6 +1452,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            launch: Mutex::new(LaunchStatus::reserved()),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
@@ -1367,6 +1549,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            launch: Mutex::new(LaunchStatus::reserved()),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&s), 48_000.0, channel().0);
@@ -1400,6 +1583,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            launch: Mutex::new(LaunchStatus::reserved()),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -1492,6 +1676,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            launch: Mutex::new(LaunchStatus::reserved()),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -1521,6 +1706,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            launch: Mutex::new(LaunchStatus::reserved()),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -1556,6 +1742,7 @@ mod tests {
                 playing: AtomicBool::new(false),
                 speed: AtomicU32::new(1000),
                 meters: Mutex::new(MeterSnapshot::default()),
+                launch: Mutex::new(LaunchStatus::reserved()),
             });
             let (tx, rx) = channel();
             let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
@@ -1586,6 +1773,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            launch: Mutex::new(LaunchStatus::reserved()),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);

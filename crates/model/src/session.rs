@@ -325,6 +325,9 @@ pub struct Session {
     /// Performance). Independent of undo so a restore survives later edits.
     #[serde(default)]
     pub midi_originals: std::collections::BTreeMap<u64, soundcraft_midi::Sequence>,
+    /// The clip launcher (scenes × tracks of looping clips). Left out of the file while unused.
+    #[serde(default, skip_serializing_if = "crate::Launcher::is_empty")]
+    pub launcher: crate::Launcher,
     #[serde(skip)]
     pub pool: SourcePool,
     /// The folder relative source paths point into: where the session was opened or last saved.
@@ -362,6 +365,7 @@ impl Session {
             next_id: 1,
             comments: String::new(),
             midi_originals: std::collections::BTreeMap::new(),
+            launcher: crate::Launcher::default(),
             pool: SourcePool::default(),
             folder: None,
         };
@@ -556,6 +560,7 @@ impl Session {
             .chain(self.busses.iter().map(|b| b.id.0))
             .chain(self.markers.iter().map(|m| m.id.0))
             .chain(self.groups.iter().map(|g| g.id.0))
+            .chain(self.launcher.clips().map(|c| c.id.0))
             .max()
             .unwrap_or(0);
         self.next_id = self.next_id.max(max_id.saturating_add(1));
@@ -594,6 +599,8 @@ impl Session {
             truncate_chars(key, MAX_NAME_CHARS);
         }
         self.midi_originals.values_mut().for_each(bound_sequence);
+        let track_ids: Vec<TrackId> = self.tracks.iter().map(|t| t.id).collect();
+        self.launcher.sanitize(&track_ids);
         let e = &mut self.edit;
         for at in [
             &mut e.selection.start,

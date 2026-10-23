@@ -50,6 +50,9 @@
 //! [`Insert::sample`]: soundcraft_model::Insert::sample
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod launch;
+pub use launch::LaunchPlayback;
+
 use soundcraft_dsp::pan::{PanLaw, SpeakerPos, SurroundParams, gains};
 use soundcraft_dsp::{Plugin, SampleSource, Transport, db_to_gain};
 use soundcraft_midi::CtrlKind;
@@ -242,6 +245,9 @@ struct Strip {
     out_extra: DelayLine,
     outbuf: Vec<Vec<f32>>,
     failures: PluginFailures,
+    /// The launcher slot (scene, start) this strip's instrument played last block, so its notes
+    /// are released when that changes.
+    launched: Option<(usize, Samples)>,
 }
 
 /// Most latency delay compensation handles: 2^20 samples, about 22 s at 48 kHz. A strip reports
@@ -321,6 +327,7 @@ impl Strip {
             out_extra: DelayLine::default(),
             outbuf: Vec::new(),
             failures: PluginFailures::default(),
+            launched: None,
         }
     }
 }
@@ -370,6 +377,8 @@ pub struct MixEngine {
     retired: Vec<Box<dyn Plugin>>,
     /// Ownership workspace reused for parallel strip processing.
     work: Vec<(usize, Strip)>,
+    /// What the clip launcher is playing (set by the playback host; offline renders leave it off).
+    pub launch: LaunchPlayback,
 }
 
 /// What `sync` needs to fill a slot.
@@ -443,6 +452,7 @@ impl MixEngine {
             adopt: HashMap::new(),
             retired: Vec::new(),
             work: Vec::new(),
+            launch: LaunchPlayback::default(),
         }
     }
 
@@ -654,7 +664,7 @@ impl MixEngine {
             }
         }
         let busses = std::mem::take(&mut self.busses);
-        let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording };
+        let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording, launch: &self.launch };
         run_strips(&mut work, |(i, st)| {
             if let Some(t) = s.tracks.get(*i) {
                 process_strip(s, t, st, &busses, &live_in, pos, frames, any_solo);
@@ -735,7 +745,7 @@ impl MixEngine {
             if st.scratch.len() < self.max_block {
                 st.scratch.resize(self.max_block, 0.0);
             }
-            let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording };
+            let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording, launch: &self.launch };
             process_strip(s, t, &mut st, &self.busses, &live_in, pos, frames, any_solo);
             let ch = st.buf.len();
             st.align.set(if pdc { lmax_a.saturating_sub(st.latency) } else { 0 }, ch);
@@ -897,6 +907,7 @@ struct LiveInput<'a> {
     input: &'a [Vec<f32>],
     monitor_only: bool,
     recording: bool,
+    launch: &'a LaunchPlayback,
 }
 
 fn process_strip(
@@ -933,6 +944,8 @@ fn process_strip(
         }
         TrackKind::Audio if live.monitor_only => {}
         TrackKind::Instrument | TrackKind::Midi if live.monitor_only => {}
+        // Session mode: the track plays its launched slot, not the timeline.
+        TrackKind::Audio if live.launch.session_mode => launch::render_audio(s, t.id, live.launch, pos, frames, &mut strip.buf),
         TrackKind::Audio => {
             let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
             for clip in t.clips() {
@@ -994,10 +1007,21 @@ fn process_strip(
                     apply_params(inst, ins, t, INSTRUMENT_SLOT, pos);
                 }
                 inst.plugin.set_transport(&transport);
-                if std::mem::take(&mut strip.chase) {
-                    chase_controllers(s, t, pos, inst);
+                if live.launch.session_mode {
+                    strip.chase = false;
+                    launch::schedule_notes(s, t.id, live.launch, pos, frames, inst, &mut strip.held, &mut strip.launched);
+                } else {
+                    if strip.launched.take().is_some() {
+                        // Leaving session mode: release what the launched slot held.
+                        for p in strip.held.drain(..) {
+                            inst.plugin.note_off(0, p);
+                        }
+                    }
+                    if std::mem::take(&mut strip.chase) {
+                        chase_controllers(s, t, pos, inst);
+                    }
+                    schedule_notes(s, t, pos, frames, inst, &mut strip.held);
                 }
-                schedule_notes(s, t, pos, frames, inst, &mut strip.held);
                 if strip.buf.len() >= 2 {
                     inst.plugin.process(&mut strip.buf, frames);
                 } else if let Some(c0) = strip.buf.first_mut() {
@@ -1419,6 +1443,11 @@ mod click {
 }
 
 fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut [Vec<f32>], _scratch: &mut [f32]) {
+    render_clip_at(s, clip, pos, frames, buf, 0);
+}
+
+/// [`render_clip`], written from frame `at` of `buf` (a block split at a launcher loop's end).
+fn render_clip_at(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut [Vec<f32>], at: usize) {
     let ClipContent::Audio { source, offset } = clip.content else { return };
     let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
     let Some(isect) = clip.range().intersect(&block) else { return };
@@ -1457,7 +1486,7 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
                     a + (b - a) * fr
                 };
                 let t = (k - i) as f32 / n;
-                if let Some(d) = dst.get_mut(k) {
+                if let Some(d) = dst.get_mut(at + k) {
                     *d += v * (g0 + (g1 - g0) * t);
                 }
             }

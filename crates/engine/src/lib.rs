@@ -70,6 +70,17 @@ pub enum TransportRequest {
     AllNotesOff,
 }
 
+/// Clip-launcher requests for the playback engine, drained by the host app each frame (see the
+/// `launcher.*` commands). Kept apart from [`TransportRequest`] so hosts without a launcher view
+/// need not handle them.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub enum LaunchRequest {
+    /// Start `scene` on `track` (stop it with `None`) at the next multiple of `quantize_bars`.
+    Launch { track: TrackId, scene: Option<usize>, quantize_bars: f64 },
+    /// Tracks play their launched slots (true) or the timeline (false).
+    SessionMode(bool),
+}
+
 /// Snapshot of the transport reported back by the host (playback position etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize)]
 pub struct TransportStatus {
@@ -118,6 +129,8 @@ pub struct Engine {
     pub history_limit: usize,
     pub clipboard: Clipboard,
     pub transport_requests: Vec<TransportRequest>,
+    /// Clip-launcher requests for the host's playback engine.
+    pub launch_requests: Vec<LaunchRequest>,
     pub transport: TransportStatus,
     /// Command journal (id, params) for macro recording / agents.
     pub journal: Vec<(String, Value)>,
@@ -159,6 +172,7 @@ impl Engine {
             history_limit: 200,
             clipboard: Clipboard::default(),
             transport_requests: Vec::new(),
+            launch_requests: Vec::new(),
             transport: TransportStatus::default(),
             journal: Vec::new(),
             path: None,
@@ -198,6 +212,9 @@ impl Engine {
         self.transport = TransportStatus { position: s.edit.selection.start.max(0), ..TransportStatus::default() };
         self.transport_requests.clear();
         self.transport_requests.push(TransportRequest::ResetSession);
+        // A new document starts on its timeline.
+        self.launch_requests.clear();
+        self.launch_requests.push(LaunchRequest::SessionMode(false));
         self.doc = Arc::new(s);
         self.saved = Arc::clone(&self.doc);
         self.undo.clear();
