@@ -27,6 +27,7 @@ pub mod record;
 
 pub use devices::AudioConfig;
 
+use soundcraft_dsp::meter::LoudnessMeter;
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
 use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
 use soundcraft_model::{Session, TrackId};
@@ -50,6 +51,34 @@ pub use soundcraft_mix::{mark_audio_thread, on_audio_thread};
 pub struct MeterSnapshot {
     pub tracks: HashMap<TrackId, StripMeter>,
     pub main: StripMeter,
+    /// Loudness of the main mix during playback.
+    pub loudness: Loudness,
+}
+
+/// ITU-R BS.1770 / EBU R128 loudness of the main mix, measured live while playing. It restarts
+/// when playback starts and holds its last values after a stop. −144 means "not measured yet".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Loudness {
+    /// LUFS over the last 400 ms.
+    pub momentary: f32,
+    /// LUFS over the last 3 s.
+    pub short_term: f32,
+    /// Gated LUFS since playback started.
+    pub integrated: f32,
+    /// Highest true peak (4× oversampled) since playback started, dBTP.
+    pub true_peak_db: f32,
+}
+
+impl Default for Loudness {
+    fn default() -> Self {
+        Loudness { momentary: -144.0, short_term: -144.0, integrated: -144.0, true_peak_db: -144.0 }
+    }
+}
+
+impl Loudness {
+    fn read(m: &LoudnessMeter) -> Self {
+        Loudness { momentary: m.momentary_lufs(), short_term: m.short_term_lufs(), integrated: m.integrated_lufs(), true_peak_db: m.true_peak_db() }
+    }
 }
 
 /// Plugin states read from the live instances: `(track, slot or INSTRUMENT_SLOT, state)`.
@@ -171,6 +200,8 @@ struct AudioState {
     /// Retired plugin instances go back to the UI thread to be dropped there.
     garbage: Sender<Vec<Box<dyn Plugin>>>,
     old_sessions: Option<SyncSender<Arc<Session>>>,
+    /// Loudness of the main mix, sized to its channels (rebuilt only when the format changes).
+    loudness: LoudnessMeter,
 }
 
 fn new_engine(sr: f32) -> MixEngine {
@@ -202,6 +233,7 @@ impl AudioState {
             device_rate,
             input: None,
             recording: false,
+            loudness: LoudnessMeter::new(sr, nch),
         }
     }
 
@@ -220,10 +252,15 @@ impl AudioState {
                     self.mix.adopt(instances);
                     // The main format changed (a document edit, not steady state): resize.
                     let nch = main_channels(&s);
-                    if self.pending.len() != nch {
+                    let sr = s.sample_rate.as_f64() as f32;
+                    let resized = self.pending.len() != nch;
+                    if resized {
                         self.pending = vec![vec![0.0; BLOCK]; nch];
                         self.pending_len = 0;
                         self.read = 0.0;
+                    }
+                    if resized || (self.loudness.sample_rate() - sr).abs() > 0.5 {
+                        self.loudness = LoudnessMeter::new(sr, nch);
                     }
                     self.fold = fold_gains(&s);
                     let old = std::mem::replace(&mut self.session, s);
@@ -240,6 +277,8 @@ impl AudioState {
                     self.pending_len = 0;
                     self.read = 0.0;
                     self.mix.reset();
+                    // Each playback pass is measured from its start.
+                    self.loudness.reset();
                 }
                 Cmd::Stop => {
                     self.playing = false;
@@ -310,8 +349,14 @@ impl AudioState {
         self.mix.render(&self.session, self.pos, n, &mut self.pending);
         self.send_garbage();
         self.pending_len = n;
+        if self.playing {
+            self.loudness.process(&self.pending, n);
+        }
         if let Ok(mut m) = self.shared.meters.try_lock() {
             m.main.copy_from(&self.mix.main_meter);
+            if self.playing {
+                m.loudness = Loudness::read(&self.loudness);
+            }
             for (k, v) in &self.mix.meters {
                 match m.tracks.get_mut(k) {
                     Some(d) => d.copy_from(v),
@@ -797,6 +842,11 @@ impl Player {
         let source = self.shared.meters.lock().unwrap_or_else(PoisonError::into_inner);
         copy_meter_snapshot(&source, out);
     }
+
+    /// The main mix's live loudness (see [`Loudness`]).
+    pub fn loudness(&self) -> Loudness {
+        self.shared.meters.lock().unwrap_or_else(PoisonError::into_inner).loudness
+    }
 }
 
 fn copy_meter_snapshot(source: &MeterSnapshot, out: &mut MeterSnapshot) {
@@ -805,6 +855,7 @@ fn copy_meter_snapshot(source: &MeterSnapshot, out: &mut MeterSnapshot) {
         out.tracks.entry(*id).or_default().copy_from(meter);
     }
     out.main.copy_from(&source.main);
+    out.loudness = source.loudness;
 }
 
 impl Side {
@@ -1199,6 +1250,53 @@ mod tests {
         let st = AudioState::new(rx, shared, Arc::new(s), 48_000.0, channel().0);
         tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
         st
+    }
+
+    #[test]
+    fn main_loudness_is_measured_live_and_restarts_with_playback() {
+        use soundcraft_model::{ChannelFormat, Clip, SourceAudio, SourceId, TrackKind};
+        let frames = 48_000 * 4;
+        let tone: Vec<f32> = (0..frames).map(|i| 0.1 * (std::f32::consts::TAU * 997.0 * i as f32 / 48_000.0).sin()).collect();
+        let mut s = Session::default();
+        s.edit.click = false;
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+        s.pool.insert(
+            SourceId(5),
+            Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![tone.clone(), tone] })),
+        );
+        let id = s.new_clip_id();
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "tone", SourceId(5), 0, 0, frames as i64));
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (tx, rx) = channel();
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
+        assert_eq!(shared.meters.lock().unwrap().loudness, Loudness::default(), "nothing measured before playback");
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        // Three seconds through a stereo device; the same output measured independently.
+        let mut reference = LoudnessMeter::new(48_000.0, 2);
+        let mut out = vec![0.0f32; 2 * 480];
+        for _ in 0..300 {
+            st.fill(&mut out, 2);
+            let planar: Vec<Vec<f32>> = (0..2).map(|c| out.iter().skip(c).step_by(2).copied().collect()).collect();
+            reference.process(&planar, 480);
+        }
+        let live = shared.meters.lock().unwrap().loudness;
+        assert!(live.integrated > -40.0 && live.integrated < 0.0, "{live:?}");
+        assert!((live.integrated - reference.integrated_lufs()).abs() < 0.3, "{live:?} vs {}", reference.integrated_lufs());
+        assert!((live.short_term - live.integrated).abs() < 0.3, "a steady tone: {live:?}");
+        assert!((live.true_peak_db - reference.true_peak_db()).abs() < 0.3, "{live:?}");
+        // A stop keeps the reading; the next Play starts a new measurement.
+        tx.send(Cmd::Stop).unwrap();
+        st.fill(&mut out, 2);
+        assert_eq!(shared.meters.lock().unwrap().loudness, live);
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        st.fill(&mut out, 2);
+        let fresh = shared.meters.lock().unwrap().loudness;
+        assert_eq!((fresh.momentary, fresh.integrated), (-144.0, -144.0), "under 400 ms measured: {fresh:?}");
     }
 
     #[test]
