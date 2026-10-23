@@ -85,3 +85,27 @@ fn dropping_an_unfinished_bounce_cancels_it_and_keeps_the_old_file() {
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn loudness_and_true_peak_targets_land_on_the_reported_levels() {
+    let mut e = soundcraft_engine::demo::demo_engine();
+    let dir = scratch("bounce-targets");
+    let path = dir.join("Song.wav").to_string_lossy().into_owned();
+    let sr = e.session().sample_rate.as_f64() as f32;
+    for (target, check) in [(serde_json::json!({"lufs": -14}), "lufs"), (serde_json::json!({"true_peak": -1}), "true_peak")] {
+        let p = serde_json::json!({"path": path, "start": {"seconds": 4.0}, "end": {"seconds": 14.0}, "bit_depth": "32f", "normalize": target});
+        let done = e.execute("file.bounce_mix", &p).unwrap();
+        let (lufs, tp) = (done["lufs"].as_f64().unwrap() as f32, done["true_peak_db"].as_f64().unwrap() as f32);
+        // What the file holds is what was reported.
+        let (_, file) = soundcraft_audio_io::decode(&std::fs::read(&path).unwrap(), None).unwrap();
+        let mut lm = soundcraft_dsp::meter::LoudnessMeter::new(sr, file.channels.len());
+        lm.process(&file.channels, file.channels[0].len());
+        assert!((lm.integrated_lufs() - lufs).abs() < 0.01 && (lm.true_peak_db() - tp).abs() < 0.01, "{check}: {done}");
+        match check {
+            // On target, unless that would push the true peak past -1 dBTP.
+            "lufs" => assert!((lufs + 14.0).abs() < 0.1 || ((tp + 1.0).abs() < 0.1 && lufs < -14.0), "{done}"),
+            _ => assert!((tp + 1.0).abs() < 0.1, "{done}"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

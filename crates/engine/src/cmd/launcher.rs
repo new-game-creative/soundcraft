@@ -49,6 +49,15 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             slot_set
         ),
+        cmd!(
+            "launcher.to_timeline",
+            "Slot to Timeline",
+            [],
+            None,
+            "{track, scene, start, end, launched?: (start)} — writes the slot onto its track's timeline over [start, end) as it plays when launched at `launched` (each loop pass a clip), replacing what was there",
+            always,
+            to_timeline
+        ),
         cmd!("launcher.quantize", "Launch Quantize", [], None, "{bars: 0 (none) | 0.25 | 0.5 | 1 | 2 | 4 …}", always, |e, p| {
             let bars = p.get("bars").and_then(Value::as_f64).filter(|v| v.is_finite()).ok_or_else(|| bad("launcher.quantize", "`bars` required"))?;
             let bars = bars.clamp(0.0, 16.0);
@@ -198,6 +207,58 @@ fn slot_from_source(e: &mut Engine, p: &Value) -> Result<Value> {
     put(e, CMD, t, scene, clip, ticks)
 }
 
+/// Captures a launched slot into the arrangement: the timeline then plays what the launcher did.
+fn to_timeline(e: &mut Engine, p: &Value) -> Result<Value> {
+    const CMD: &str = "launcher.to_timeline";
+    let (t, scene) = slot_param(e, CMD, p)?;
+    let start = position_param(e, CMD, p, "start")?.ok_or_else(|| bad(CMD, "`start` required"))?.max(0);
+    let end = position_param(e, CMD, p, "end")?.ok_or_else(|| bad(CMD, "`end` required"))?;
+    if end <= start {
+        return Err(bad(CMD, "`end` must be after `start`"));
+    }
+    let launched = position_param(e, CMD, p, "launched")?.unwrap_or(start);
+    let s = e.session();
+    let slot = s.launcher.slot(t, scene).ok_or_else(|| bad(CMD, "that slot is empty"))?.clone();
+    if s.track(t).and_then(|x| x.playlist()).is_none() {
+        return Err(bad(CMD, "the track has no playlist"));
+    }
+    // Each loop pass is the slot's clip placed at the pass start, cut at the pass end and to the range.
+    let mut pieces = Vec::new();
+    let mut at = start.max(launched);
+    while at < end && pieces.len() < 4096 {
+        let Some((a, b)) = soundcraft_mix::launch_iteration(s, &slot, launched, at) else { break };
+        let mut clip = slot.clip.clone();
+        clip.start = a;
+        clip.length = clip.length.min(b - a);
+        let (lo, hi) = (at, end.min(clip.end()));
+        if hi > lo {
+            pieces.push((clip, lo, hi));
+        }
+        at = b;
+    }
+    let s = e.session_mut();
+    crate::edit::clear_range(s, t, soundcraft_time::Range::new(start, end), false);
+    let mut ids = Vec::new();
+    for (clip, lo, hi) in pieces {
+        let tc = crate::edit::TimeCtx::of(s);
+        let mut c = clip;
+        if lo > c.start
+            && let Some((_, right)) = crate::edit::split_clip(&c, lo, c.id, tc)
+        {
+            c = right;
+        }
+        if hi < c.end()
+            && let Some((left, _)) = crate::edit::split_clip(&c, hi, c.id, tc)
+        {
+            c = left;
+        }
+        c.id = s.new_clip_id();
+        ids.push(c.id);
+        crate::edit::place_clip(s, t, c);
+    }
+    Ok(json!({"clips": ids}))
+}
+
 fn slot_set(e: &mut Engine, p: &Value) -> Result<Value> {
     const CMD: &str = "launcher.slot_set";
     let (t, scene) = slot_param(e, CMD, p)?;
@@ -289,5 +350,54 @@ mod tests {
         let before = e.session().launcher.clone();
         e.execute("edit.undo", &json!({})).unwrap();
         assert_ne!(e.session().launcher.quantize_bars, before.quantize_bars);
+    }
+
+    /// The launched slot and the clips captured from it render the same samples.
+    #[test]
+    fn a_slot_written_to_the_timeline_plays_as_launched() {
+        let (mut e, kick) = engine();
+        let kick_id = soundcraft_model::TrackId(kick);
+        let clip = e.session().track(kick_id).unwrap().clips()[0].id.0;
+        e.execute("launcher.scene_add", &json!({})).unwrap();
+        e.execute("launcher.slot_from_clip", &json!({"clip": clip, "scene": 0, "loop_bars": 1.5})).unwrap();
+        let bar = e.session().tempo.tick_to_samples(3840, e.session().sample_rate);
+        // Launched mid-bar, captured from a later point: the passes keep the launch's phase.
+        let (launched, start) = (bar / 3, bar * 2 + 777);
+        let end = start + bar * 4;
+        let solo_kick = |s: &mut soundcraft_model::Session| {
+            s.edit.click = false;
+            for t in &mut s.tracks {
+                t.mixer.mute = t.id != kick_id;
+            }
+        };
+        let render = |s: &soundcraft_model::Session, session_mode: bool| {
+            let mut m = soundcraft_mix::MixEngine::new(s.sample_rate.as_f64() as f32, 1024);
+            m.launch.session_mode = session_mode;
+            m.launch.set(kick_id, session_mode.then_some(0), launched);
+            let mut out = vec![vec![0.0f32; 1000]; 2];
+            let mut all = Vec::new();
+            let mut pos = start;
+            while pos < end {
+                m.render(s, pos, 1000, &mut out);
+                all.extend_from_slice(&out[0]);
+                pos += 1000;
+            }
+            all.truncate(usize::try_from(end - start).unwrap());
+            all
+        };
+        let mut s = (*e.session_arc()).clone();
+        solo_kick(&mut s);
+        let live = render(&s, true);
+        assert!(live.iter().any(|x| x.abs() > 0.01), "the slot is audible");
+
+        e.execute("launcher.to_timeline", &json!({"track": kick, "scene": 0, "start": start, "end": end, "launched": launched})).unwrap();
+        let mut s2 = (*e.session_arc()).clone();
+        solo_kick(&mut s2);
+        let captured = render(&s2, false);
+        let worst = live.iter().zip(&captured).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-5, "differs by {worst}");
+
+        e.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(e.session().track(kick_id).unwrap().clips(), s.track(kick_id).unwrap().clips(), "one undo step");
     }
 }

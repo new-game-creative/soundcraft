@@ -84,7 +84,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 crate::io::import_video_bytes(e, &path, bytes, at)
             }
         ),
-        cmd!(noundo "file.bounce_mix", "Bounce Mix...", ["File"], Some("Cmd+Alt+B"), "{path, format?: wav|aiff|flac, bit_depth?: 16|24|32f, start?, end?, source?: main|bus name, normalize?: false, dither?: true, fold_down?: stereo}", always, bounce),
+        cmd!(noundo "file.bounce_mix", "Bounce Mix...", ["File"], Some("Cmd+Alt+B"), "{path, format?: wav|aiff|flac, bit_depth?: 16|24|32f, start?, end?, source?: main|bus name, normalize?: false | true (peak -0.1 dBFS) | {lufs: -14} | {true_peak: -1} | {peak: dB}, dither?: true, fold_down?: stereo}", always, bounce),
         cmd!(noundo "file.bounce_stems", "Bounce Stems...", [], None, "{dir, format?: wav|aiff|flac, bit_depth?: 16|24|32f, start?, end?, fold_down?: stereo}", has_tracks, |e, p| {
             let dir = str_param(p, "dir").ok_or_else(|| bad("file.bounce_stems", "`dir` required"))?.to_string();
             let r = range_param(e, "file.bounce_stems", p)?;
@@ -310,10 +310,29 @@ pub fn bounce_job(e: &Engine, p: &Value) -> Result<crate::io::Bounce> {
         _ => soundcraft_audio_io::BitDepth::Int24,
     };
     let opts = soundcraft_audio_io::EncodeOptions { format, bit_depth, dither: bool_or(p, "dither", true), bwf: None };
-    let normalize = bool_or(p, "normalize", false);
+    let normalize = normalize_param(p)?;
     let fold = fold_down_param(p, "file.bounce_mix")?;
     let bus = bounce_bus(e, p)?;
-    crate::io::Bounce::new(e.session_arc(), std::path::Path::new(&path), r, &opts, bus, normalize, fold)
+    Ok(crate::io::Bounce::new(e.session_arc(), std::path::Path::new(&path), r, &opts, bus, false, fold)?.normalize_to(normalize))
+}
+
+/// `normalize`: a bool (peak at -0.1 dBFS), or a target `{lufs}`, `{true_peak}` or `{peak}`.
+fn normalize_param(p: &Value) -> Result<crate::io::Normalize> {
+    use crate::io::Normalize;
+    let Some(v) = p.get("normalize") else { return Ok(Normalize::Off) };
+    if let Some(on) = v.as_bool() {
+        return Ok(if on { Normalize::Peak(-0.1) } else { Normalize::Off });
+    }
+    let target = |key: &str, lo: f64, hi: f64| v.get(key).and_then(Value::as_f64).filter(|x| x.is_finite()).map(|x| x.clamp(lo, hi) as f32);
+    if let Some(x) = target("lufs", -70.0, 0.0) {
+        Ok(Normalize::Lufs(x))
+    } else if let Some(x) = target("true_peak", -60.0, 0.0) {
+        Ok(Normalize::TruePeak(x))
+    } else if let Some(x) = target("peak", -60.0, 0.0) {
+        Ok(Normalize::Peak(x))
+    } else {
+        Err(bad("file.bounce_mix", "`normalize` is a bool or {lufs | true_peak | peak: dB}"))
+    }
 }
 
 /// Write the score of the chosen MIDI tracks as MusicXML (or SVG when `svg`).

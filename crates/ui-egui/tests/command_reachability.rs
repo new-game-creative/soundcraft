@@ -27,6 +27,7 @@ const KNOWN_UNREACHED: &[&str] = &[
     "launcher.slot_set",
     "launcher.stop",
     "launcher.stop_all",
+    "launcher.to_timeline",
     "edit.paste_clip_effects",
     "edit.paste_clip_gain",
     "event.midi_note",

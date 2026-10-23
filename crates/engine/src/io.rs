@@ -382,8 +382,8 @@ pub struct Bounce {
     range: Range,
     bus: Option<BusId>,
     fold: Option<ChannelFormat>,
-    normalize: bool,
-    /// Measuring the peak to normalize to, the first of two passes.
+    normalize: Normalize,
+    /// Measuring the level to normalize to, the first of two passes.
     measuring: bool,
     render: soundcraft_mix::RangeRender,
     block: Vec<Vec<f32>>,
@@ -392,6 +392,35 @@ pub struct Bounce {
     peak: f32,
     meter: soundcraft_dsp::meter::LoudnessMeter,
     enc: Option<soundcraft_audio_io::FileEncoder<Out>>,
+}
+
+/// What a bounce is normalized to, measured in a first pass over the range.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Normalize {
+    Off,
+    /// Sample peak at this dBFS.
+    Peak(f32),
+    /// Integrated loudness at this LUFS, turned down if needed so the true peak stays at or
+    /// below -1 dBTP (so a quiet, peaky mix lands under the target rather than clipping).
+    Lufs(f32),
+    /// True peak at this dBTP.
+    TruePeak(f32),
+}
+
+/// The ceiling a loudness-normalized bounce keeps its true peak under.
+pub const LUFS_TRUE_PEAK_CEILING: f32 = -1.0;
+
+impl Normalize {
+    /// The gain that brings a mix measured as `peak` (linear) and `meter` to the target.
+    fn gain(self, peak: f32, meter: &soundcraft_dsp::meter::LoudnessMeter) -> f32 {
+        let db = match self {
+            Normalize::Off => return 1.0,
+            Normalize::Peak(to) => return if peak > 0.0 { soundcraft_dsp::db_to_gain(to) / peak } else { 1.0 },
+            Normalize::TruePeak(to) => Some(to - meter.true_peak_db()),
+            Normalize::Lufs(to) => Some((to - meter.integrated_lufs()).min(LUFS_TRUE_PEAK_CEILING - meter.true_peak_db())),
+        };
+        db.filter(|d| d.is_finite()).map_or(1.0, |d| soundcraft_dsp::db_to_gain(d.clamp(-96.0, 96.0)))
+    }
 }
 
 /// A finished bounce: the size of its file and its levels.
@@ -442,7 +471,7 @@ impl Bounce {
             range: r,
             bus,
             fold,
-            normalize,
+            normalize: if normalize { Normalize::Peak(-0.1) } else { Normalize::Off },
             measuring: normalize,
             render,
             block: Vec::new(),
@@ -452,6 +481,14 @@ impl Bounce {
             meter,
             enc: Some(enc),
         })
+    }
+
+    /// Normalizes to `to` instead (set before the first [`Bounce::step`]).
+    #[must_use]
+    pub fn normalize_to(mut self, to: Normalize) -> Self {
+        self.normalize = to;
+        self.measuring = to != Normalize::Off;
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -465,7 +502,7 @@ impl Bounce {
     /// How far along the bounce is, from 0 to 1.
     pub fn progress(&self) -> f32 {
         let pass = (self.done as f64 / self.range.len().max(1) as f64).min(1.0) as f32;
-        match (self.normalize, self.measuring) {
+        match (self.normalize != Normalize::Off, self.measuring) {
             (false, _) => pass,
             (true, true) => pass / 2.0,
             (true, false) => 0.5 + pass / 2.0,
@@ -481,15 +518,16 @@ impl Bounce {
                     fill(&mut self.block, chunk, n, self.fold, self.gain);
                     self.done += n;
                     self.peak = self.peak.max(soundcraft_dsp::offline::peak(&self.block));
-                    if !self.measuring {
-                        self.meter.process(&self.block, n);
-                        if let Some(enc) = &mut self.enc {
-                            enc.write(&self.block, n).map_err(|err| EngineError::Io(format!("{}: {err}", self.path.display())))?;
-                        }
+                    self.meter.process(&self.block, n);
+                    if !self.measuring
+                        && let Some(enc) = &mut self.enc
+                    {
+                        enc.write(&self.block, n).map_err(|err| EngineError::Io(format!("{}: {err}", self.path.display())))?;
                     }
                 }
                 None if self.measuring => {
-                    self.gain = if self.peak > 0.0 { soundcraft_dsp::db_to_gain(-0.1) / self.peak } else { 1.0 };
+                    self.gain = self.normalize.gain(self.peak, &self.meter);
+                    self.meter = soundcraft_dsp::meter::LoudnessMeter::new(self.session.sample_rate.as_f64() as f32, self.block.len());
                     self.peak = 0.0;
                     self.done = 0;
                     self.measuring = false;
