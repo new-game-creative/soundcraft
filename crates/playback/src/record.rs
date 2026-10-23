@@ -432,9 +432,130 @@ impl TakeWriter {
     }
 }
 
+/// What a take records inside the mix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TapSource {
+    /// A track's output after its inserts.
+    Track(TrackId),
+    /// The main mix.
+    Main,
+}
+
+/// One take recording inside the mix: the audio thread pushes the source's blocks into `ring`
+/// (interleaved, `channels` wide), the tap writer drains it into the take's file.
+pub(crate) struct FeedTap {
+    pub(crate) source: TapSource,
+    pub(crate) channels: usize,
+    ring: CaptureRing,
+}
+
+impl FeedTap {
+    /// Queues `frames` frames of `src` (planar), mapped onto the take's channels (a mono source
+    /// fills every channel; a take with fewer channels keeps the first ones). Never allocates.
+    pub(crate) fn push(&self, src: &[Vec<f32>], frames: usize) {
+        let (ch, n_src) = (self.channels.max(1), src.len());
+        if n_src == 0 {
+            return;
+        }
+        self.ring.push(frames * ch, |i| {
+            let (f, c) = (i / ch, i % ch);
+            src.get(c.min(n_src - 1)).and_then(|s| s.get(f)).copied().map_or(0.0, finite)
+        });
+    }
+}
+
+/// The takes recording inside the mix, shared by the audio thread and the tap writer.
+pub(crate) struct TapFeed {
+    pub(crate) taps: Vec<FeedTap>,
+}
+
+/// The thread writing the takes of a [`TapFeed`].
+pub(crate) struct TapWriter {
+    stop: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<Takes>,
+}
+
+/// Creates each take's file and starts the writer: `takes` are (track recording, its source, its
+/// channels, its file), at the session's `rate`.
+pub(crate) fn start_taps(takes: Vec<(TrackId, TapSource, usize, PathBuf)>, rate: u32) -> Result<(Arc<TapFeed>, TapWriter), String> {
+    let mut writers = Vec::new();
+    let mut taps = Vec::new();
+    for (id, source, channels, path) in takes {
+        let channels = channels.clamp(1, 8);
+        writers.push(TakeWriter::create(id, (0..channels).collect(), path, rate)?);
+        let ring = CaptureRing::new((rate as usize).saturating_mul(channels * RING_SECONDS).min(1 << 25));
+        taps.push(FeedTap { source, channels, ring });
+    }
+    let feed = Arc::new(TapFeed { taps });
+    let stop = Arc::new(AtomicBool::new(false));
+    let (f, s) = (Arc::clone(&feed), Arc::clone(&stop));
+    let handle = std::thread::Builder::new().name("tap writer".into()).spawn(move || write_taps(&f, writers, &s)).map_err(|e| e.to_string())?;
+    Ok((feed, TapWriter { stop, handle }))
+}
+
+impl TapWriter {
+    /// Writes what is left and closes the files: the takes that hold audio and the first problem.
+    pub(crate) fn finish(self) -> Takes {
+        self.stop.store(true, Ordering::Release);
+        self.handle.join().unwrap_or_default()
+    }
+}
+
+fn write_taps(feed: &TapFeed, mut takes: Vec<TakeWriter>, stop: &AtomicBool) -> Takes {
+    let mut blocks: Vec<Vec<f32>> = feed.taps.iter().map(|_| Vec::new()).collect();
+    let mut header_written = Instant::now();
+    loop {
+        let stopping = stop.load(Ordering::Acquire);
+        for ((tap, take), block) in feed.taps.iter().zip(takes.iter_mut()).zip(blocks.iter_mut()) {
+            tap.ring.pop_all(block);
+            let ch = tap.channels.max(1);
+            let whole = block.len() - block.len() % ch;
+            take.write(&block[..whole], ch);
+            block.drain(..whole);
+        }
+        if stopping {
+            break;
+        }
+        if header_written.elapsed() >= Duration::from_secs(1) {
+            header_written = Instant::now();
+            takes.iter_mut().for_each(TakeWriter::write_header);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (mut done, mut problem) = (Vec::new(), None);
+    for mut t in takes {
+        t.write_header();
+        if t.frames == 0 {
+            let _ = std::fs::remove_file(&t.path);
+        } else {
+            done.push((t.id, t.path));
+        }
+        problem = problem.or(t.error);
+    }
+    (done, problem)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tap_writes_its_source_onto_the_takes_channels() {
+        let dir = std::env::temp_dir().join(format!("soundcraft-taps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (stereo, mono) = (dir.join("st.wav"), dir.join("mono.wav"));
+        let takes = vec![(TrackId(1), TapSource::Track(TrackId(9)), 2, stereo.clone()), (TrackId(2), TapSource::Main, 1, mono.clone())];
+        let (feed, writer) = start_taps(takes, 48_000).unwrap();
+        // A mono source into a stereo take fills both channels; a stereo one into a mono take keeps its left.
+        feed.taps[0].push(&[vec![0.25; 100]], 100);
+        feed.taps[1].push(&[vec![0.5; 100], vec![-0.5; 100]], 100);
+        let (done, problem) = writer.finish();
+        assert_eq!(problem, None);
+        assert_eq!(done, vec![(TrackId(1), stereo.clone()), (TrackId(2), mono.clone())]);
+        assert_eq!(decode(&stereo), vec![vec![0.25; 100]; 2]);
+        assert_eq!(decode(&mono), vec![vec![0.5; 100]]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn decode(path: &PathBuf) -> Vec<Vec<f32>> {
         soundcraft_audio_io::decode(&std::fs::read(path).unwrap(), None).unwrap().1.channels

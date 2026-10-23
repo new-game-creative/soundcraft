@@ -198,7 +198,15 @@ pub fn specs() -> Vec<CommandSpec> {
                 Ok(json!({"clips": ids}))
             }
         ),
-        cmd!("track.input", "Track Input", [], None, "{tracks?, input: none|bus name|hardware name}", has_selection, |e, p| route(e, p, true)),
+        cmd!(
+            "track.input",
+            "Track Input",
+            [],
+            None,
+            "{tracks?, input: none|off|bus name|hardware name (\"In 1\", \"In 1-2\")|track:<name> (that track's output)|master|midi:<device> (\"midi:\" every device, \"midi:keyboard\")}",
+            has_selection,
+            |e, p| route(e, p, true)
+        ),
         cmd!("track.output", "Track Output", [], None, "{tracks?, output: main|none|bus name}", has_selection, |e, p| route(e, p, false)),
         cmd!("track.timebase", "Track Timebase", [], None, "{tracks?, ticks: bool}", has_selection, |e, p| flag(
             e,
@@ -905,8 +913,19 @@ fn select_playlist(e: &mut Engine, p: &Value) -> Result<Value> {
 }
 
 pub(crate) fn parse_route(s: &soundcraft_model::Session, v: &str) -> Route {
-    match v.to_ascii_lowercase().as_str() {
+    let lower = v.to_ascii_lowercase();
+    // `track:<name or id>`: another track's output; `midi:<device>` (`midi:` every device,
+    // `midi:keyboard` the computer keyboard); `off`: no input at all.
+    if let Some(t) = lower.strip_prefix("track:").map(|_| v["track:".len()..].trim()) {
+        let found = s.tracks.iter().find(|x| x.name == t).or_else(|| t.parse::<u64>().ok().and_then(|id| s.track(soundcraft_model::TrackId(id))));
+        return found.map_or(Route::None, |x| Route::Track(x.id));
+    }
+    if lower.starts_with("midi:") {
+        return Route::Midi(v["midi:".len()..].trim().to_string());
+    }
+    match lower.as_str() {
         "" | "none" | "no input" | "no output" => Route::None,
+        "off" => Route::Hardware(Route::OFF.to_string()),
         "main" | "out 1-2" | "master" => Route::Main,
         _ => s.bus_by_name(v).map_or_else(|| Route::Hardware(v.to_string()), |b| Route::Bus(b.id)),
     }
@@ -921,6 +940,7 @@ fn route(e: &mut Engine, p: &Value, input: bool) -> Result<Value> {
     let mut r = parse_route(s, &v);
     if let Route::Hardware(name) = &r
         && create_bus
+        && !r.is_off()
         && !name.to_ascii_lowercase().starts_with("in ")
     {
         let fmt = tracks

@@ -136,6 +136,10 @@ pub(crate) fn route_name(app: &SoundApp, r: &Route) -> String {
         Route::Main => app.engine.session().outputs.first().map_or_else(|| "Out 1-2".into(), |o| o.name.clone()),
         Route::Bus(b) => app.engine.session().bus(*b).map_or_else(|| "bus?".into(), |b| b.name.clone()),
         Route::Hardware(h) => h.clone(),
+        Route::Track(t) => app.engine.session().track(*t).map_or_else(|| "track?".into(), |t| t.name.clone()),
+        Route::Midi(d) if d.is_empty() => "All MIDI".into(),
+        Route::Midi(d) if d == "keyboard" => "Computer keyboard".into(),
+        Route::Midi(d) => d.clone(),
     }
 }
 

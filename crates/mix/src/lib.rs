@@ -379,6 +379,10 @@ pub struct MixEngine {
     work: Vec<(usize, Strip)>,
     /// What the clip launcher is playing (set by the playback host; offline renders leave it off).
     pub launch: LaunchPlayback,
+    /// Tracks whose output after their inserts the host records (see [`MixEngine::tap`]).
+    pub tapped: Vec<TrackId>,
+    /// Live MIDI for the next block, played on the instrument tracks it names (the host routes it).
+    pub live_notes: Vec<LiveNote>,
 }
 
 /// What `sync` needs to fill a slot.
@@ -453,6 +457,8 @@ impl MixEngine {
             retired: Vec::new(),
             work: Vec::new(),
             launch: LaunchPlayback::default(),
+            tapped: Vec::new(),
+            live_notes: Vec::with_capacity(LIVE_NOTES),
         }
     }
 
@@ -623,6 +629,12 @@ impl MixEngine {
     }
 
     /// Render `frames` (≤ max_block) samples starting at `pos` into `out` (≥ 2 channels).
+    /// A tapped track's output after its inserts (before its fader) in the last block rendered,
+    /// for recording it: list the track in [`MixEngine::tapped`] first.
+    pub fn tap(&self, track: TrackId) -> Option<&[Vec<f32>]> {
+        self.strips.get(&track).map(|st| st.pre.as_slice()).filter(|p| !p.is_empty())
+    }
+
     pub fn render(&mut self, s: &Session, pos: Samples, frames: usize, out: &mut [Vec<f32>]) {
         let frames = frames.min(self.max_block);
         if pos != self.last_end {
@@ -664,7 +676,14 @@ impl MixEngine {
             }
         }
         let busses = std::mem::take(&mut self.busses);
-        let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording, launch: &self.launch };
+        let live_in = LiveInput {
+            input: &self.input,
+            monitor_only: self.monitor_only,
+            recording: self.recording,
+            launch: &self.launch,
+            tapped: &self.tapped,
+            notes: &self.live_notes,
+        };
         run_strips(&mut work, |(i, st)| {
             if let Some(t) = s.tracks.get(*i) {
                 process_strip(s, t, st, &busses, &live_in, pos, frames, any_solo);
@@ -745,7 +764,14 @@ impl MixEngine {
             if st.scratch.len() < self.max_block {
                 st.scratch.resize(self.max_block, 0.0);
             }
-            let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording, launch: &self.launch };
+            let live_in = LiveInput {
+                input: &self.input,
+                monitor_only: self.monitor_only,
+                recording: self.recording,
+                launch: &self.launch,
+                tapped: &self.tapped,
+                notes: &self.live_notes,
+            };
             process_strip(s, t, &mut st, &self.busses, &live_in, pos, frames, any_solo);
             let ch = st.buf.len();
             st.align.set(if pdc { lmax_a.saturating_sub(st.latency) } else { 0 }, ch);
@@ -908,6 +934,60 @@ struct LiveInput<'a> {
     monitor_only: bool,
     recording: bool,
     launch: &'a LaunchPlayback,
+    tapped: &'a [TrackId],
+    notes: &'a [LiveNote],
+}
+
+/// Live notes [`MixEngine::live_notes`] holds without allocating.
+pub const LIVE_NOTES: usize = 256;
+
+/// A live MIDI note for an instrument track in the next block: a note on, or a note off when
+/// `velocity` is 0. `offset` is the frame in the block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveNote {
+    pub track: TrackId,
+    pub offset: usize,
+    pub pitch: u8,
+    pub velocity: u8,
+}
+
+/// Whether `t` plays live MIDI: an armed or monitoring instrument track whose input is MIDI (or
+/// not set, which means every MIDI device).
+pub fn plays_live_midi(t: &Track) -> bool {
+    matches!(t.kind, TrackKind::Instrument | TrackKind::Midi)
+        && (t.mixer.record_arm || t.mixer.input_monitor)
+        && matches!(t.mixer.input, Route::None | Route::Midi(_))
+}
+
+/// Plays this block's live notes for `t` on its instrument, keeping `held` (to release at a seek).
+fn play_live_notes(t: &Track, inst: &mut PluginSlot, notes: &[LiveNote], held: &mut Vec<u8>) {
+    for n in notes.iter().filter(|n| n.track == t.id) {
+        if n.velocity == 0 {
+            inst.plugin.note_off(n.offset, n.pitch);
+            held.retain(|p| *p != n.pitch);
+        } else {
+            inst.plugin.note_on(n.offset, n.pitch, n.velocity);
+            if !held.contains(&n.pitch) && held.len() < 128 {
+                held.push(n.pitch);
+            }
+        }
+    }
+}
+
+/// Runs the instrument over the block (a mono track renders in stereo and folds).
+fn render_instrument(inst: &mut PluginSlot, buf: &mut [Vec<f32>], scratch: &mut Vec<f32>, frames: usize) {
+    if buf.len() >= 2 {
+        inst.plugin.process(buf, frames);
+    } else if let Some(c0) = buf.first_mut() {
+        let mut st = [std::mem::take(c0), std::mem::take(scratch)];
+        inst.plugin.process(&mut st, frames);
+        let [a, b] = st;
+        *c0 = a;
+        *scratch = b;
+        for (x, y) in c0.iter_mut().zip(scratch.iter()).take(frames) {
+            *x = 0.5 * (*x + *y);
+        }
+    }
 }
 
 fn process_strip(
@@ -943,7 +1023,22 @@ fn process_strip(
             }
         }
         TrackKind::Audio if live.monitor_only => {}
-        TrackKind::Instrument | TrackKind::Midi if live.monitor_only => {}
+        // Stopped: an instrument plays only what is played live into it.
+        TrackKind::Instrument | TrackKind::Midi if live.monitor_only => {
+            if plays_live_midi(t)
+                && let Some(inst) = strip.instrument.as_mut().filter(|i| !i.failed)
+            {
+                if let Some(ins) = &t.instrument {
+                    apply_params(inst, ins, t, INSTRUMENT_SLOT, pos);
+                }
+                inst.plugin.set_transport(&transport);
+                play_live_notes(t, inst, live.notes, &mut strip.held);
+                render_instrument(inst, &mut strip.buf, &mut strip.scratch, frames);
+                if contain_failure(inst, &mut strip.buf, frames) {
+                    strip.failures.record(INSTRUMENT_SLOT);
+                }
+            }
+        }
         // Session mode: the track plays its launched slot, not the timeline.
         TrackKind::Audio if live.launch.session_mode => launch::render_audio(s, t.id, live.launch, pos, frames, &mut strip.buf),
         TrackKind::Audio => {
@@ -1022,19 +1117,10 @@ fn process_strip(
                     }
                     schedule_notes(s, t, pos, frames, inst, &mut strip.held);
                 }
-                if strip.buf.len() >= 2 {
-                    inst.plugin.process(&mut strip.buf, frames);
-                } else if let Some(c0) = strip.buf.first_mut() {
-                    // Mono MIDI track: render the instrument in stereo and fold.
-                    let mut st = [std::mem::take(c0), std::mem::take(&mut strip.scratch)];
-                    inst.plugin.process(&mut st, frames);
-                    let [a, b] = st;
-                    *c0 = a;
-                    strip.scratch = b;
-                    for (x, y) in c0.iter_mut().zip(strip.scratch.iter()).take(frames) {
-                        *x = 0.5 * (*x + *y);
-                    }
+                if plays_live_midi(t) {
+                    play_live_notes(t, inst, live.notes, &mut strip.held);
                 }
+                render_instrument(inst, &mut strip.buf, &mut strip.scratch, frames);
                 if contain_failure(inst, &mut strip.buf, frames) {
                     strip.failures.record(INSTRUMENT_SLOT);
                 }
@@ -1072,7 +1158,8 @@ fn process_strip(
     let auto_mute = t.mixer.automation_mode.reads() && t.lane(&AutoParam::Mute).is_some_and(|l| l.value_at(pos, 0.0) >= 0.5);
     let soloed_out = any_solo && !t.mixer.solo && !t.mixer.solo_safe && !receives_solo(s, t);
     strip.muted = t.mixer.mute || auto_mute || soloed_out;
-    if t.mixer.sends.iter().flatten().any(|x| x.pre_fader) {
+    // Pre-fader sends and taps (recording this track's sound elsewhere) read it here.
+    if t.mixer.sends.iter().flatten().any(|x| x.pre_fader) || live.tapped.contains(&t.id) {
         strip.pre.resize_with(strip.buf.len(), Vec::new);
         for (d, src) in strip.pre.iter_mut().zip(strip.buf.iter()) {
             d.clear();
@@ -2344,6 +2431,57 @@ mod tests {
         let (loud, quiet) = (rms(-6.0), rms(-12.0));
         assert!(loud > 0.0, "the synth should sound");
         assert!((quiet / loud - 0.5).abs() < 0.05, "-12 dB vs -6 dB should halve the level: {quiet} / {loud}");
+    }
+
+    /// Peak of a block.
+    fn peak(out: &[Vec<f32>], frames: usize) -> f32 {
+        out.iter().flat_map(|c| c.iter().take(frames)).fold(0.0f32, |m, x| m.max(x.abs()))
+    }
+
+    #[test]
+    fn a_live_note_plays_an_armed_instrument_even_when_stopped() {
+        let mut s = synth_session(-6.0);
+        // No timeline notes: only what is played live sounds.
+        s.tracks[0].playlist_mut().unwrap().clips.clear();
+        let t = s.tracks[0].id;
+        let mut e = MixEngine::new(48_000.0, 512);
+        e.monitor_only = true;
+        let mut out = vec![vec![0.0f32; 512]; 2];
+        e.live_notes.push(LiveNote { track: t, offset: 0, pitch: 60, velocity: 100 });
+        e.render(&s, 0, 512, &mut out);
+        assert_eq!(peak(&out, 512), 0.0, "a track that isn't armed doesn't play live notes");
+        s.tracks[0].mixer.record_arm = true;
+        let mut e = MixEngine::new(48_000.0, 512);
+        e.monitor_only = true;
+        e.live_notes.push(LiveNote { track: t, offset: 0, pitch: 60, velocity: 100 });
+        e.render(&s, 0, 512, &mut out);
+        e.live_notes.clear();
+        let mut loudest = 0.0f32;
+        for k in 1..8 {
+            e.render(&s, 0, 512, &mut out);
+            loudest = loudest.max(peak(&out, 512));
+            let _ = k;
+        }
+        assert!(loudest > 0.01, "the armed instrument plays the live note: {loudest}");
+        // A MIDI input from a named device still plays (the host routes by device).
+        s.tracks[0].mixer.input = Route::Midi("KeyStep".into());
+        assert!(plays_live_midi(&s.tracks[0]));
+        s.tracks[0].mixer.input = Route::Hardware("In 1".into());
+        assert!(!plays_live_midi(&s.tracks[0]), "an audio input is not a MIDI input");
+    }
+
+    #[test]
+    fn a_tapped_track_shows_its_sound_before_the_fader() {
+        let (mut s, t) = session_with_dc(0.5, 4_800);
+        s.track_mut(t).unwrap().mixer.volume_db = -144.0;
+        let mut e = MixEngine::new(48_000.0, 512);
+        let mut out = vec![vec![0.0f32; 512]; 2];
+        e.render(&s, 0, 512, &mut out);
+        assert!(e.tap(t).is_none(), "untapped tracks keep no copy");
+        e.tapped.push(t);
+        e.render(&s, 512, 512, &mut out);
+        let tap = e.tap(t).expect("tapped");
+        assert!(peak(tap, 512) > 0.4, "the tap is before the fader (which is all the way down)");
     }
 
     #[test]

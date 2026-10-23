@@ -23,6 +23,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod devices;
+#[cfg(not(target_arch = "wasm32"))]
+mod midi_in;
 pub mod record;
 
 pub use devices::AudioConfig;
@@ -116,6 +118,46 @@ enum Cmd {
         scene: usize,
         start: Samples,
     },
+    /// Takes recording inside the mix (`None`: stop feeding them).
+    Taps(Option<Arc<record::TapFeed>>),
+    /// A live MIDI message from input `device` (an index into [`Cmd::MidiDevices`], or
+    /// [`KEYBOARD`]).
+    Midi {
+        device: u16,
+        data: [u8; 3],
+    },
+    /// The names of the open MIDI inputs, by device index.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    MidiDevices(Arc<Vec<String>>),
+}
+
+/// The MIDI "device" of the computer keyboard (see [`Player::play_midi`]).
+pub const KEYBOARD: u16 = u16::MAX;
+/// Played notes kept for the UI between its reads.
+const PLAYED_CAPACITY: usize = 8192;
+
+/// A live note played into a record-enabled track while recording: a note on, or a note off when
+/// `velocity` is 0, at transport position `at`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayedNote {
+    pub track: TrackId,
+    pub at: Samples,
+    pub pitch: u8,
+    pub velocity: u8,
+}
+
+/// Whether a track's MIDI input takes messages from `device` (by index into `names`).
+fn takes_midi_from(input: &soundcraft_model::Route, device: u16, names: &[String]) -> bool {
+    use soundcraft_model::Route;
+    match input {
+        // Every device, but not the computer keyboard: that is chosen on purpose (its keys are
+        // shortcuts otherwise).
+        Route::None => device != KEYBOARD,
+        Route::Midi(want) if want.is_empty() => device != KEYBOARD,
+        Route::Midi(want) if want == "keyboard" => device == KEYBOARD,
+        Route::Midi(want) => names.get(usize::from(device)).is_some_and(|n| n == want),
+        _ => false,
+    }
 }
 
 /// What the clip launcher is playing and has queued, for the UI.
@@ -145,6 +187,8 @@ struct Shared {
     speed: AtomicU32,
     meters: Mutex<MeterSnapshot>,
     launch: Mutex<LaunchStatus>,
+    /// Live MIDI played into record-enabled tracks while recording, for the UI to make clips of.
+    played: Mutex<Vec<PlayedNote>>,
 }
 
 /// What stopped the audio output.
@@ -240,12 +284,17 @@ struct AudioState {
     loudness: LoudnessMeter,
     /// Launcher changes waiting for their quantise boundary: (track, scene or stop, sample).
     launch_queue: Vec<(TrackId, Option<usize>, Samples)>,
+    /// Takes recording inside the mix, fed after each block while recording.
+    taps: Option<Arc<record::TapFeed>>,
+    /// MIDI input names by device index.
+    midi_names: Arc<Vec<String>>,
 }
 
 fn new_engine(sr: f32) -> MixEngine {
     let mut m = MixEngine::new(sr, BLOCK);
     m.set_external_instances(true);
     m.metronome = true;
+    m.tapped.reserve(64);
     m
 }
 
@@ -273,12 +322,56 @@ impl AudioState {
             recording: false,
             loudness: LoudnessMeter::new(sr, nch),
             launch_queue: Vec::with_capacity(LAUNCH_CAPACITY),
+            taps: None,
+            midi_names: Arc::new(Vec::new()),
         }
         .with_launch_capacity()
     }
 
+    /// Lists the tracks the taps record in the mix (within the reserved capacity: no allocation).
+    fn sync_tapped(&mut self) {
+        self.mix.tapped.clear();
+        for tap in self.taps.iter().flat_map(|f| f.taps.iter()) {
+            if let record::TapSource::Track(t) = tap.source
+                && !self.mix.tapped.contains(&t)
+                && self.mix.tapped.len() < self.mix.tapped.capacity()
+            {
+                self.mix.tapped.push(t);
+            }
+        }
+    }
+
+    /// Hands a live note to every instrument track listening to `device`, and while recording
+    /// keeps it for the record-enabled ones. Other messages are ignored.
+    fn route_midi(&mut self, device: u16, data: [u8; 3]) {
+        let (status, pitch, vel) = (data[0] & 0xF0, data[1] & 0x7F, data[2] & 0x7F);
+        let velocity = match status {
+            0x90 => vel,
+            0x80 => 0,
+            _ => return,
+        };
+        let at = self.pos;
+        let recording = self.recording && self.playing;
+        let mut played = if recording { self.shared.played.try_lock().ok() } else { None };
+        for t in self.session.tracks.iter().filter(|t| soundcraft_mix::plays_live_midi(t)) {
+            if !takes_midi_from(&t.mixer.input, device, &self.midi_names) {
+                continue;
+            }
+            if self.mix.live_notes.len() < soundcraft_mix::LIVE_NOTES {
+                self.mix.live_notes.push(soundcraft_mix::LiveNote { track: t.id, offset: 0, pitch, velocity });
+            }
+            if t.mixer.record_arm
+                && let Some(p) = played.as_mut()
+                && p.len() < p.capacity()
+            {
+                p.push(PlayedNote { track: t.id, at, pitch, velocity });
+            }
+        }
+    }
+
     fn with_launch_capacity(mut self) -> Self {
         self.mix.launch.playing.reserve(LAUNCH_CAPACITY);
+        self.mix.tapped.reserve(64);
         self
     }
 
@@ -337,6 +430,7 @@ impl AudioState {
                     if (s.sample_rate.as_f64() - self.session.sample_rate.as_f64()).abs() > 0.5 {
                         let mut old = std::mem::replace(&mut self.mix, new_engine(s.sample_rate.as_f64() as f32));
                         let _ = self.garbage.send(old.drain_plugins());
+                        self.sync_tapped();
                     }
                     self.mix.adopt(instances);
                     // The main format changed (a document edit, not steady state): resize.
@@ -408,6 +502,12 @@ impl AudioState {
                     self.read = 0.0;
                     self.mix.reset();
                 }
+                Cmd::Taps(feed) => {
+                    self.taps = feed;
+                    self.sync_tapped();
+                }
+                Cmd::MidiDevices(names) => self.midi_names = names,
+                Cmd::Midi { device, data } => self.route_midi(device, data),
             }
         }
         if changed {
@@ -467,6 +567,22 @@ impl AudioState {
         self.mix.monitor_only = !self.playing;
         self.mix.recording = self.recording;
         self.mix.render(&self.session, self.pos, n, &mut self.pending);
+        self.mix.live_notes.clear();
+        if self.recording
+            && self.playing
+            && let Some(feed) = &self.taps
+        {
+            for tap in &feed.taps {
+                match tap.source {
+                    record::TapSource::Track(t) => {
+                        if let Some(src) = self.mix.tap(t) {
+                            tap.push(src, n);
+                        }
+                    }
+                    record::TapSource::Main => tap.push(&self.pending, n),
+                }
+            }
+        }
         self.send_garbage();
         self.pending_len = n;
         if self.playing {
@@ -496,7 +612,8 @@ impl AudioState {
     fn fill(&mut self, out: &mut [f32], channels: usize) {
         self.drain();
         let channels = channels.max(1);
-        let monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
+        let monitoring = (self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm))
+            || self.session.tracks.iter().any(soundcraft_mix::plays_live_midi);
         if !self.playing && !monitoring {
             out.iter_mut().for_each(|x| *x = 0.0);
             if let Ok(mut m) = self.shared.meters.try_lock() {
@@ -581,11 +698,27 @@ struct Side {
     refused: HashSet<(TrackId, usize)>,
     garbage: Receiver<Vec<Box<dyn Plugin>>>,
     old_sessions: Option<Receiver<Arc<Session>>>,
+    /// The takes recording inside the mix, while they record.
+    taps: Option<record::TapWriter>,
+    /// The open MIDI inputs.
+    #[cfg(not(target_arch = "wasm32"))]
+    midi: Option<midi_in::MidiInputs>,
 }
 
 impl Side {
     fn new(rate: f32, garbage: Receiver<Vec<Box<dyn Plugin>>>) -> Side {
-        Side { shadow: HashMap::new(), rate, editors: HashMap::new(), states: BTreeMap::new(), refused: HashSet::new(), garbage, old_sessions: None }
+        Side {
+            shadow: HashMap::new(),
+            rate,
+            editors: HashMap::new(),
+            states: BTreeMap::new(),
+            refused: HashSet::new(),
+            garbage,
+            old_sessions: None,
+            taps: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            midi: None,
+        }
     }
 
     /// Drops retired instances (closing their editors first, inside the plugin's drop) and
@@ -681,6 +814,7 @@ impl Player {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
+            played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
         });
         let want = session.sample_rate.hz();
         let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
@@ -920,6 +1054,59 @@ impl Player {
     /// Feed live input (from a `record::Recorder`) into the mix for input monitoring.
     pub fn set_input(&self, ring: Arc<record::InputRing>) {
         let _ = self.tx.send(Cmd::Input(ring));
+    }
+
+    /// Starts recording takes inside the mix: each `(track, source, channels, file)` records its
+    /// source (another track's output after its inserts, or the main mix) at the session's
+    /// `rate`, from the next block on while the transport records. Stop with [`Player::finish_taps`].
+    pub fn record_taps(&self, takes: Vec<(TrackId, record::TapSource, usize, std::path::PathBuf)>, rate: u32) -> Result<(), String> {
+        let mut side = self.side();
+        if side.taps.is_some() {
+            return Err("already recording".into());
+        }
+        let (feed, writer) = record::start_taps(takes, rate)?;
+        side.taps = Some(writer);
+        let _ = self.tx.send(Cmd::Taps(Some(feed)));
+        Ok(())
+    }
+
+    /// Stops the takes recording inside the mix: the ones that hold audio, and the first problem.
+    pub fn finish_taps(&self) -> record::Takes {
+        let _ = self.tx.send(Cmd::Taps(None));
+        let writer = self.side().taps.take();
+        writer.map(record::TapWriter::finish).unwrap_or_default()
+    }
+
+    /// Opens every MIDI input (again: devices plugged in since are found), returning their names.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_midi_inputs(&self) -> Vec<String> {
+        let mut side = self.side();
+        side.midi = None;
+        let inputs = midi_in::open(&self.tx);
+        let names = inputs.names.clone();
+        side.midi = Some(inputs);
+        let _ = self.tx.send(Cmd::MidiDevices(Arc::new(names.clone())));
+        names
+    }
+
+    /// The names of the open MIDI inputs.
+    pub fn midi_inputs(&self) -> Vec<String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.side().midi.as_ref().map(|m| m.names.clone()).unwrap_or_default()
+        }
+        #[cfg(target_arch = "wasm32")]
+        Vec::new()
+    }
+
+    /// Plays a MIDI message as if it came from `device` ([`KEYBOARD`] for the computer keyboard).
+    pub fn play_midi(&self, device: u16, data: [u8; 3]) {
+        let _ = self.tx.send(Cmd::Midi { device, data });
+    }
+
+    /// The live notes played into record-enabled tracks while recording since the last call.
+    pub fn take_played(&self) -> Vec<PlayedNote> {
+        self.shared.played.lock().map(|mut p| p.drain(..).collect()).unwrap_or_default()
     }
 
     pub fn set_recording(&self, on: bool) {
@@ -1309,6 +1496,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
+            played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
         };
         let fault = Fault::default();
         let mut out = [0.5f32; 8];
@@ -1351,6 +1539,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
+            played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -1370,6 +1559,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
+            played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -1395,6 +1585,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
+            played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
         });
         let (tx, rx) = channel();
         let st = AudioState::new(rx, shared, Arc::new(s), 48_000.0, channel().0);
@@ -1422,6 +1613,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
+            played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
@@ -1476,6 +1668,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
+            played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
@@ -1573,6 +1766,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
+            played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&s), 48_000.0, channel().0);
@@ -1607,6 +1801,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
+            played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -1700,6 +1895,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
+            played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -1730,6 +1926,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
+            played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -1766,6 +1963,7 @@ mod tests {
                 speed: AtomicU32::new(1000),
                 meters: Mutex::new(MeterSnapshot::default()),
                 launch: Mutex::new(LaunchStatus::reserved()),
+                played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
             });
             let (tx, rx) = channel();
             let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
@@ -1797,6 +1995,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
+            played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
@@ -1810,5 +2009,86 @@ mod tests {
         st.fill(&mut out, 2);
         assert!(out.iter().any(|x| x.abs() > 0.1), "the input is heard");
         assert!(shared.meters.lock().unwrap().tracks.get(&t).is_some_and(|m| m.peak[0] > 0.1), "and metered");
+    }
+
+    fn shared_for_tests() -> Arc<Shared> {
+        Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+            launch: Mutex::new(LaunchStatus::reserved()),
+            played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+        })
+    }
+
+    #[test]
+    fn live_midi_reaches_the_tracks_listening_to_its_device_and_is_kept_while_recording() {
+        use soundcraft_model::{ChannelFormat, Route, TrackKind};
+        let mut s = soundcraft_model::Session::default();
+        let keys = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        let pad = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        let idle = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        for (t, input) in [(keys, Route::Midi("KeyStep".into())), (pad, Route::Midi("keyboard".into())), (idle, Route::None)] {
+            let m = &mut s.track_mut(t).unwrap().mixer;
+            m.input = input;
+            m.record_arm = t != idle;
+        }
+        let shared = shared_for_tests();
+        let (tx, rx) = channel();
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
+        tx.send(Cmd::MidiDevices(Arc::new(vec!["Launchkey".into(), "KeyStep".into()]))).unwrap();
+        tx.send(Cmd::Midi { device: 1, data: [0x90, 60, 100] }).unwrap();
+        tx.send(Cmd::Midi { device: KEYBOARD, data: [0x91, 64, 90] }).unwrap();
+        tx.send(Cmd::Midi { device: 0, data: [0xB0, 1, 64] }).unwrap();
+        st.drain();
+        let got: Vec<(TrackId, u8, u8)> = st.mix.live_notes.iter().map(|n| (n.track, n.pitch, n.velocity)).collect();
+        assert_eq!(got, vec![(keys, 60, 100), (pad, 64, 90)], "by device; unarmed tracks and controllers get nothing");
+        assert!(shared.played.lock().unwrap().is_empty(), "not recording: nothing kept");
+        // Recording: kept with the transport position.
+        st.mix.live_notes.clear();
+        st.recording = true;
+        st.playing = true;
+        st.pos = 4_800;
+        tx.send(Cmd::Midi { device: 1, data: [0x80, 60, 0] }).unwrap();
+        st.drain();
+        assert_eq!(*shared.played.lock().unwrap(), vec![PlayedNote { track: keys, at: 4_800, pitch: 60, velocity: 0 }]);
+    }
+
+    #[test]
+    fn a_tap_records_a_track_before_its_fader_only_while_recording() {
+        use soundcraft_model::{ChannelFormat, TrackKind};
+        let mut s = soundcraft_model::Session::default();
+        s.edit.click = false;
+        let src = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let dst = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let id = soundcraft_model::SourceId(1);
+        s.pool.insert(
+            id,
+            Arc::new(soundcraft_model::SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.5; 48_000]] })),
+        );
+        let cid = s.new_clip_id();
+        s.track_mut(src).unwrap().playlist_mut().unwrap().clips.push(soundcraft_model::Clip::audio(cid, "dc", id, 0, 0, 48_000));
+        s.track_mut(src).unwrap().mixer.volume_db = -144.0;
+        let shared = shared_for_tests();
+        let (tx, rx) = channel();
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
+        let dir = std::env::temp_dir().join(format!("soundcraft-tap-play-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("print.wav");
+        let (feed, writer) = record::start_taps(vec![(dst, record::TapSource::Track(src), 1, path.clone())], 48_000).unwrap();
+        tx.send(Cmd::Taps(Some(feed))).unwrap();
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        let mut out = vec![0.0f32; 2048];
+        st.fill(&mut out, 2);
+        tx.send(Cmd::Recording(true)).unwrap();
+        st.fill(&mut out, 2);
+        st.fill(&mut out, 2);
+        let (done, problem) = writer.finish();
+        assert_eq!((done.len(), problem), (1, None));
+        let audio = soundcraft_audio_io::decode(&std::fs::read(&path).unwrap(), None).unwrap().1.channels;
+        let n = audio[0].len();
+        assert!(n >= 1024 && audio[0].iter().all(|x| (x - 0.5).abs() < 1e-6), "{n} frames of the source, its fader all the way down");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

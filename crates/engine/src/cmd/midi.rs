@@ -19,6 +19,15 @@ pub fn specs() -> Vec<CommandSpec> {
             has_tracks,
             new_clip
         ),
+        cmd!(
+            "midi.record_take",
+            "Record MIDI Take",
+            [],
+            None,
+            "{track, start, end, events: [[at: samples, pitch, velocity (0: note off)]]} — a MIDI clip over [start, end) of the notes played live (input quantize applies); notes still held at `end` end there",
+            always,
+            record_take
+        ),
         cmd!("midi.note_add", "Add Note", [], None, "{clip, pitch, start_ticks, length_ticks?: 480, velocity?: 100, channel?: 0}", always, note_add),
         cmd!("midi.note_edit", "Edit Note", [], None, "{clip, index, pitch?, start_ticks?, length_ticks?, velocity?}", always, note_edit),
         cmd!("midi.note_delete", "Delete Notes", [], None, "{clip, indices: [n]}", always, note_delete),
@@ -59,6 +68,75 @@ fn new_clip(e: &mut Engine, p: &Value) -> Result<Value> {
     let name = s.track(t).map(|x| x.name.clone()).unwrap_or_default();
     crate::edit::place_clip(s, t, Clip::midi(id, name, r.start, r.len(), Sequence::default()));
     Ok(json!({"clip": id, "start": r.start, "end": r.end}))
+}
+
+/// Live notes played while recording become a clip on the track (see `Player::take_played`).
+fn record_take(e: &mut Engine, p: &Value) -> Result<Value> {
+    const CMD: &str = "midi.record_take";
+    let t = track_param(e, CMD, p, "track")?.ok_or_else(|| bad(CMD, "`track` required"))?;
+    if !e.session().track(t).is_some_and(|x| x.kind.is_midi()) {
+        return Err(bad(CMD, "not a MIDI or instrument track"));
+    }
+    let start = position_param(e, CMD, p, "start")?.ok_or_else(|| bad(CMD, "`start` required"))?.max(0);
+    let end = position_param(e, CMD, p, "end")?.ok_or_else(|| bad(CMD, "`end` required"))?;
+    if end <= start {
+        return Err(bad(CMD, "`end` must be after `start`"));
+    }
+    let events = p.get("events").and_then(Value::as_array).ok_or_else(|| bad(CMD, "`events` required"))?;
+    let mut evs: Vec<(Samples, u8, u8)> = Vec::new();
+    for ev in events {
+        let f = |i: usize| ev.get(i).and_then(Value::as_i64);
+        let (Some(at), Some(pitch), Some(vel)) = (f(0), f(1), f(2)) else { return Err(bad(CMD, "each event is [at, pitch, velocity]")) };
+        evs.push((at, pitch.clamp(0, 127) as u8, vel.clamp(0, 127) as u8));
+    }
+    evs.sort_by_key(|e| e.0);
+    let s = e.session();
+    let (sr, tempo) = (s.sample_rate, &s.tempo);
+    let t0 = tempo.samples_to_ticks(start, sr);
+    let ticks = |at: Samples| tempo.samples_to_ticks(at.clamp(start, end), sr) - t0;
+    // Pair each note on with the next note off of its pitch.
+    let mut held: Vec<(u8, u8, Samples)> = Vec::new();
+    let mut notes = Vec::new();
+    let mut finish = |pitch: u8, vel: u8, from: Samples, to: Samples| {
+        if from < end && to > start {
+            notes.push(Note {
+                pitch,
+                velocity: vel.max(1),
+                release_velocity: 64,
+                channel: 0,
+                start: ticks(from),
+                length: (ticks(to) - ticks(from)).max(1),
+            });
+        }
+    };
+    for (at, pitch, vel) in evs {
+        if let Some(i) = held.iter().position(|h| h.0 == pitch) {
+            let (p, v, from) = held.remove(i);
+            finish(p, v, from, at);
+        }
+        if vel > 0 {
+            held.push((pitch, vel, at));
+        }
+    }
+    for (p, v, from) in held {
+        finish(p, v, from, end);
+    }
+    if s.edit.flag("midi.input_quantize") {
+        let opts = soundcraft_midi::ops::QuantizeOptions {
+            grid_ticks: s.edit.value("midi.input_quantize.grid_ticks", (TICKS_PER_QUARTER / 4) as f64) as i64,
+            strength: (s.edit.value("midi.input_quantize.strength", 100.0) / 100.0) as f32,
+            swing: (s.edit.value("midi.input_quantize.swing", 0.0) / 100.0) as f32,
+            ..Default::default()
+        };
+        soundcraft_midi::ops::quantize(&mut notes, &opts);
+    }
+    notes.sort_by_key(|n| (n.start, n.pitch));
+    let n = notes.len();
+    let s = e.session_mut();
+    let id = s.new_clip_id();
+    let name = s.track(t).map(|x| x.name.clone()).unwrap_or_default();
+    crate::edit::place_clip(s, t, Clip::midi(id, name, start, end - start, Sequence { notes, ..Sequence::default() }));
+    Ok(json!({"clip": id, "notes": n}))
 }
 
 fn note_add(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -177,5 +255,35 @@ mod tests {
         let mut e = Engine::default();
         let t = e.session_mut().add_track(TrackKind::Audio, ChannelFormat::Mono, None);
         assert!(e.execute("midi.new_clip", &json!({"track": t.0})).is_err());
+    }
+    #[test]
+    fn live_notes_become_a_clip_input_quantized_and_one_undo_step() {
+        let mut e = crate::demo::demo_engine();
+        let keys = e.session().tracks.iter().find(|t| t.name == "Keys").unwrap().id.0;
+        let beat = e.session().tempo.tick_to_samples(960, e.session().sample_rate);
+        let (start, end) = (beat * 16, beat * 20);
+        // C held a beat, E from beat 2 never released, a stray note off, a note off before the take.
+        let events = json!([[start + 30, 60, 100], [start + beat, 60, 0], [start + beat * 2 + 50, 64, 90], [start + 10, 70, 0], [start - 10, 72, 0]]);
+        let before = e.session().track(soundcraft_model::TrackId(keys)).unwrap().clips().len();
+        let r = e.execute("midi.record_take", &json!({"track": keys, "start": start, "end": end, "events": events})).unwrap();
+        let clip = e.session().find_clip(soundcraft_model::ClipId(r["clip"].as_u64().unwrap())).unwrap().1.clone();
+        assert_eq!((clip.start, clip.length), (start, end - start));
+        let ClipContent::Midi { sequence } = &clip.content else { panic!("a MIDI clip") };
+        let got: Vec<(u8, i64, i64)> = sequence.notes.iter().map(|n| (n.pitch, n.start, n.length)).collect();
+        let t = |at: i64| {
+            e.session().tempo.samples_to_ticks(at, e.session().sample_rate) - e.session().tempo.samples_to_ticks(start, e.session().sample_rate)
+        };
+        assert_eq!(
+            got,
+            vec![(60, t(start + 30), t(start + beat) - t(start + 30)), (64, t(start + beat * 2 + 50), t(end) - t(start + beat * 2 + 50))]
+        );
+        // With input quantize on, starts snap to sixteenths.
+        e.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(e.session().track(soundcraft_model::TrackId(keys)).unwrap().clips().len(), before);
+        e.execute("event.input_quantize", &json!({"enabled": true, "grid": "1/16"})).unwrap();
+        let r = e.execute("midi.record_take", &json!({"track": keys, "start": start, "end": end, "events": events})).unwrap();
+        let clip = e.session().find_clip(soundcraft_model::ClipId(r["clip"].as_u64().unwrap())).unwrap().1.clone();
+        let ClipContent::Midi { sequence } = &clip.content else { panic!("a MIDI clip") };
+        assert!(sequence.notes.iter().all(|n| n.start % 240 == 0), "{:?}", sequence.notes);
     }
 }

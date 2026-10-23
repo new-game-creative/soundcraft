@@ -418,6 +418,29 @@ pub enum Route {
     Bus(BusId),
     /// Hardware input/output by path name.
     Hardware(String),
+    /// As an input: another track's output after its inserts (recording an instrument's or a
+    /// track's sound; a MIDI track's notes for a MIDI track).
+    Track(crate::TrackId),
+    /// As an input: live MIDI from the device of this name; `""` is every device, `"keyboard"`
+    /// the computer keyboard.
+    Midi(String),
+}
+
+impl Route {
+    /// The input name that records nothing ("Off").
+    pub const OFF: &'static str = "Off";
+
+    /// An input that is explicitly off.
+    pub fn is_off(&self) -> bool {
+        matches!(self, Route::Hardware(h) if h.eq_ignore_ascii_case(Self::OFF))
+    }
+
+    /// The first hardware input channel (0-based) an "In N" or "In N-M" input names.
+    pub fn input_channel(&self) -> Option<usize> {
+        let Route::Hardware(h) = self else { return None };
+        let n = h.strip_prefix("In ").or_else(|| h.strip_prefix("in "))?;
+        n.split(['-', ' ', '/']).next()?.trim().parse::<usize>().ok().filter(|n| *n > 0).map(|n| n - 1)
+    }
 }
 
 /// A plugin instance on an insert slot.

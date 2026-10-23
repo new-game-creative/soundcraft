@@ -1417,27 +1417,72 @@ fn read_bundle(bytes: &[u8]) -> Result<(String, std::collections::HashMap<String
     Ok((text, files))
 }
 
-/// The record-enabled audio tracks, each with the input channels it records (those its input
-/// route names, "In 3" → 2, wrapped to the device's `input_channels`) and a new take file
-/// `<track>_<NN>.wav` in the `Audio Files` of the session's folder (`unsaved_dir` until it is saved).
+/// Where a record-enabled audio track's take comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakeSource {
+    /// The audio interface, from this input channel (0-based).
+    Hardware(usize),
+    /// Inside the mix: another track's output after its inserts.
+    Track(TrackId),
+    /// Inside the mix: the main mix (resampling).
+    Main,
+}
+
+/// Where `t` records from, `None` when its input is off (or names nothing it can record).
+pub fn take_source(t: &soundcraft_model::Track) -> Option<TakeSource> {
+    use soundcraft_model::Route;
+    match &t.mixer.input {
+        r if r.is_off() => None,
+        Route::Track(src) => (*src != t.id).then_some(TakeSource::Track(*src)),
+        Route::Main => Some(TakeSource::Main),
+        Route::Midi(_) => None,
+        // "In 3" → 2; anything else (no input set, a bus, a name without a number) records the
+        // first input, as it always has.
+        r => Some(TakeSource::Hardware(r.input_channel().unwrap_or(0))),
+    }
+}
+
+fn take_file(dir: &Path, t: &soundcraft_model::Track, take_no: usize) -> PathBuf {
+    let file = |n: usize| dir.join("Audio Files").join(format!("{}_{n:02}.wav", sanitize_name(&t.name)));
+    (take_no..take_no + 1_000).map(file).find(|p| !p.exists()).unwrap_or_else(|| file(take_no))
+}
+
+fn armed_audio(s: &Session) -> impl Iterator<Item = &soundcraft_model::Track> {
+    s.tracks.iter().filter(|t| t.mixer.record_arm && t.kind == TrackKind::Audio && !t.inactive)
+}
+
+fn takes_dir<'a>(e: &'a Engine, unsaved_dir: &'a Path) -> &'a Path {
+    e.path.as_deref().and_then(|p| Path::new(p).parent()).unwrap_or(unsaved_dir)
+}
+
+/// The record-enabled audio tracks that record the audio interface, each with the input channels
+/// it records (those its input route names, "In 3" → 2, wrapped to the device's
+/// `input_channels`) and a new take file `<track>_<NN>.wav` in the `Audio Files` of the session's
+/// folder (`unsaved_dir` until it is saved). Tracks recording inside the mix are in
+/// [`plan_internal_takes`].
 pub fn plan_takes(e: &Engine, unsaved_dir: &Path, input_channels: usize) -> Vec<(TrackId, Vec<usize>, PathBuf)> {
-    let dir = e.path.as_deref().and_then(|p| Path::new(p).parent()).unwrap_or(unsaved_dir);
+    let dir = takes_dir(e, unsaved_dir);
     let s = e.session();
     let take_no = s.sources.len() + 1;
-    s.tracks
-        .iter()
-        .filter(|t| t.mixer.record_arm && t.kind == TrackKind::Audio && !t.inactive)
-        .map(|t| {
-            let first = match &t.mixer.input {
-                soundcraft_model::Route::Hardware(h) => {
-                    h.trim_start_matches("In ").split(['-', ' ']).next().and_then(|n| n.parse::<usize>().ok()).map_or(0, |n| n.saturating_sub(1))
-                }
-                _ => 0,
-            };
+    armed_audio(s)
+        .filter_map(|t| {
+            let Some(TakeSource::Hardware(first)) = take_source(t) else { return None };
             let inputs = (0..t.channels()).map(|k| first.saturating_add(k) % input_channels.max(1)).collect();
-            let file = |n: usize| dir.join("Audio Files").join(format!("{}_{n:02}.wav", sanitize_name(&t.name)));
-            let path = (take_no..take_no + 1_000).map(file).find(|p| !p.exists()).unwrap_or_else(|| file(take_no));
-            (t.id, inputs, path)
+            Some((t.id, inputs, take_file(dir, t, take_no)))
+        })
+        .collect()
+}
+
+/// The record-enabled audio tracks that record inside the mix (another track's output, or the
+/// main mix), each with its source, its channel count and a new take file (as [`plan_takes`]).
+pub fn plan_internal_takes(e: &Engine, unsaved_dir: &Path) -> Vec<(TrackId, TakeSource, usize, PathBuf)> {
+    let dir = takes_dir(e, unsaved_dir);
+    let s = e.session();
+    let take_no = s.sources.len() + 1;
+    armed_audio(s)
+        .filter_map(|t| match take_source(t)? {
+            TakeSource::Hardware(_) => None,
+            src => Some((t.id, src, t.channels(), take_file(dir, t, take_no))),
         })
         .collect()
 }
@@ -1556,6 +1601,26 @@ mod record_tests {
         bytes.extend((0..frames).flat_map(|i| (i as f32 / frames as f32 - 0.5).to_le_bytes()));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn takes_record_the_interface_another_track_the_main_mix_or_nothing() {
+        let dir = std::env::temp_dir().join(format!("soundcraft-take-sources-{}", std::process::id()));
+        let mut e = Engine::default();
+        let vox = armed(&mut e, "Vox", "mono", "In 2");
+        let synth = armed(&mut e, "Synth", "stereo", "In 1");
+        let print = armed(&mut e, "Print", "stereo", "track:Synth");
+        let master = armed(&mut e, "Bounce", "stereo", "master");
+        let off = armed(&mut e, "Spare", "mono", "off");
+        assert!(e.session().track(off).unwrap().mixer.input.is_off(), "off is an input, not a new bus");
+        assert!(e.session().busses.is_empty());
+        let hw: Vec<TrackId> = plan_takes(&e, &dir, 4).into_iter().map(|t| t.0).collect();
+        assert_eq!(hw, vec![vox, synth]);
+        let internal: Vec<(TrackId, TakeSource, usize)> = plan_internal_takes(&e, &dir).into_iter().map(|t| (t.0, t.1, t.2)).collect();
+        assert_eq!(internal, vec![(print, TakeSource::Track(synth), 2), (master, TakeSource::Main, 2)]);
+        // A track can't record itself.
+        e.execute("track.input", &json!({"tracks": [print.0], "input": "track:Print"})).unwrap();
+        assert!(plan_internal_takes(&e, &dir).iter().all(|t| t.0 != print));
     }
 
     #[test]

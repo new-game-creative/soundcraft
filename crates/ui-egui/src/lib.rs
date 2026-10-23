@@ -539,14 +539,38 @@ impl SoundApp {
             self.record_hint = Some((self.last_frame.unwrap_or_default(), why));
             return;
         }
-        self.ensure_input();
-        let takes = match self.arm_recorder() {
+        // Takes from the audio interface, from inside the mix (another track, the main mix) and
+        // of live MIDI on instrument tracks.
+        let wants_hardware = !soundcraft_engine::io::plan_takes(&self.engine, std::path::Path::new("."), 1).is_empty();
+        if wants_hardware {
+            self.ensure_input();
+        }
+        let takes = match if wants_hardware { self.arm_recorder() } else { Ok(Vec::new()) } {
             Ok(takes) => takes,
             Err(err) => {
                 self.ui.status = format!("Cannot record: {err}");
                 return;
             }
         };
+        let internal = match self.arm_taps() {
+            Ok(n) => n,
+            Err(err) => {
+                if let Some(r) = &mut self.recorder {
+                    r.finish();
+                }
+                self.ui.status = format!("Cannot record: {err}");
+                return;
+            }
+        };
+        let midi = self.engine.session().tracks.iter().any(|t| t.mixer.record_arm && soundcraft_mix::plays_live_midi(t));
+        if takes.is_empty() && internal == 0 && !midi {
+            self.ui.status = "Cannot record: no track is record-enabled".into();
+            return;
+        }
+        if let Some(p) = &self.player {
+            // Notes played before this take don't belong to it.
+            let _ = p.take_played();
+        }
         self.lost_shown = 0;
         if let Some(p) = &self.player {
             p.set_recording(true);
@@ -588,6 +612,60 @@ impl SoundApp {
         if let Some(root) = self.autosave_dir.clone() {
             self.queue_autosave(root);
         }
+    }
+
+    /// The live notes played into record-enabled instrument tracks become one MIDI clip each, over
+    /// the punch (or loop) range, else from where recording started to where it stopped. Returns
+    /// how many clips.
+    fn place_played(&mut self, plan: &soundcraft_engine::io::Recording, played: Vec<soundcraft_playback::PlayedNote>) -> usize {
+        if played.is_empty() {
+            return 0;
+        }
+        let (start, end) = match (plan.punch, plan.pass) {
+            (Some(r), _) => (r.start, r.end),
+            (None, Some(pass)) => (plan.start, plan.start + pass),
+            (None, None) => (plan.start, self.engine.transport.position.max(plan.start + 1)),
+        };
+        let mut tracks: Vec<TrackId> = played.iter().map(|n| n.track).collect();
+        tracks.dedup();
+        tracks.sort_by_key(|t| t.0);
+        tracks.dedup();
+        let mut n = 0;
+        for t in tracks {
+            let events: Vec<Value> = played.iter().filter(|p| p.track == t).map(|p| json!([p.at, p.pitch, p.velocity])).collect();
+            let p = json!({"track": t.0, "start": start, "end": end, "events": events});
+            match self.engine.execute_merged("midi.record_take", &p, "record.midi") {
+                Ok(_) => n += 1,
+                Err(e) => log::warn!("recording MIDI: {e}"),
+            }
+        }
+        self.engine.end_merge();
+        n
+    }
+
+    /// Start the takes recorded inside the mix (tracks whose input is another track or the main
+    /// mix), at the session's rate. Returns how many.
+    fn arm_taps(&mut self) -> Result<usize, String> {
+        let name = soundcraft_engine::io::sanitize_name(&self.engine.session().name);
+        let unsaved_dir = self.autosave_dir.as_ref().map_or_else(std::env::temp_dir, |d| d.join(name));
+        let plan = soundcraft_engine::io::plan_internal_takes(&self.engine, &unsaved_dir);
+        if plan.is_empty() {
+            return Ok(0);
+        }
+        let Some(p) = &self.player else { return Err("no audio engine".into()) };
+        let n = plan.len();
+        let takes = plan
+            .into_iter()
+            .map(|(track, src, channels, path)| {
+                let src = match src {
+                    soundcraft_engine::io::TakeSource::Track(t) => soundcraft_playback::record::TapSource::Track(t),
+                    _ => soundcraft_playback::record::TapSource::Main,
+                };
+                (track, src, channels, path)
+            })
+            .collect();
+        p.record_taps(takes, self.engine.session().sample_rate.hz())?;
+        Ok(n)
     }
 
     /// Arm the input for the record-enabled tracks; a session never saved records into its
@@ -916,8 +994,17 @@ impl SoundApp {
             p.set_recording(false);
         }
         let plan = self.take_plan.take();
-        let Some(r) = &mut self.recorder else { return };
-        let (takes, problem) = r.finish();
+        let (mut takes, mut problem) = self.recorder.as_mut().map(soundcraft_playback::record::Recorder::finish).unwrap_or_default();
+        // Takes recorded inside the mix go in with the interface's, as one undo step.
+        if let Some(p) = &self.player {
+            let (tapped, tap_problem) = p.finish_taps();
+            takes.extend(tapped);
+            problem = problem.or(tap_problem);
+        }
+        let played = self.player.as_ref().map(soundcraft_playback::Player::take_played).unwrap_or_default();
+        if takes.is_empty() && played.is_empty() && plan.is_none() {
+            return;
+        }
         let tracks = takes.len().max(1);
         let plan = plan.unwrap_or_else(|| soundcraft_engine::io::Recording {
             start: self.record_start,
@@ -929,8 +1016,12 @@ impl SoundApp {
         self.punch = None;
         self.autosaved_rev = 0;
         let ids = soundcraft_engine::io::place_recording(&mut self.engine, &plan, takes);
-        self.ui.status =
-            if plan.pass.is_some() { format!("Loop-recorded {} take(s)", ids.len() / tracks) } else { format!("Recorded {} clip(s)", ids.len()) };
+        let midi = self.place_played(&plan, played);
+        self.ui.status = if plan.pass.is_some() {
+            format!("Loop-recorded {} take(s)", ids.len() / tracks)
+        } else {
+            format!("Recorded {} clip(s)", ids.len() + midi)
+        };
         if let Some(p) = problem {
             log::warn!("recording: {p}");
             self.ui.status = format!("{} ({p})", self.ui.status);
@@ -1592,5 +1683,67 @@ mod tests {
         app.handle_transport(1.0 / 60.0);
         assert!(!app.is_playing());
         assert!((speed(&app) - 1.0).abs() < 1e-3, "a half-speed pass that ends on its own restores full speed");
+    }
+
+    #[test]
+    fn notes_played_into_an_armed_instrument_track_while_recording_become_a_clip() {
+        use serde_json::json;
+        let engine = soundcraft_engine::demo::demo_engine();
+        let player = soundcraft_playback::Player::new(engine.session_arc());
+        let mut app = super::SoundApp::new(engine, Some(player), super::Services::default());
+        let keys = app.engine.session().tracks.iter().find(|t| t.name == "Keys").unwrap().id;
+        let before = app.engine.session().track(keys).unwrap().clips().len();
+        app.engine.execute("track.input", &json!({"tracks": [keys.0], "input": "midi:keyboard"})).unwrap();
+        app.engine.execute("mix.record_arm", &json!({"tracks": [keys.0], "value": true})).unwrap();
+        app.engine.execute("edit.select", &json!({"start": 0})).unwrap();
+        app.engine.execute("transport.record", &json!({})).unwrap();
+        app.handle_transport(1.0 / 60.0);
+        assert!(app.engine.transport.recording, "{}", app.ui.status);
+        let p = app.player.as_ref().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        p.play_midi(soundcraft_playback::KEYBOARD, [0x90, 67, 100]);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        p.play_midi(soundcraft_playback::KEYBOARD, [0x80, 67, 0]);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.handle_transport(1.0 / 60.0);
+        app.engine.execute("transport.stop", &json!({})).unwrap();
+        app.handle_transport(1.0 / 60.0);
+        let clips = app.engine.session().track(keys).unwrap().clips().to_vec();
+        assert_eq!(clips.len(), before + 1, "{}", app.ui.status);
+        let take = clips.iter().find(|c| c.start == 0).expect("the take starts where recording did");
+        let soundcraft_model::ClipContent::Midi { sequence } = &take.content else { panic!("a MIDI clip") };
+        assert_eq!(sequence.notes.iter().map(|n| n.pitch).collect::<Vec<_>>(), vec![67]);
+    }
+
+    #[test]
+    fn a_track_recording_another_tracks_output_gets_its_sound() {
+        use serde_json::json;
+        let engine = soundcraft_engine::demo::demo_engine();
+        let player = soundcraft_playback::Player::new(engine.session_arc());
+        let mut app = super::SoundApp::new(engine, Some(player), super::Services::default());
+        let dir = std::env::temp_dir().join(format!("soundcraft-print-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        app.autosave_dir = Some(dir.clone());
+        let print = app.engine.execute("track.new", &json!({"name": "Print", "format": "stereo"})).unwrap()["tracks"][0].as_u64().unwrap();
+        app.engine.execute("track.input", &json!({"tracks": [print], "input": "track:Bass"})).unwrap();
+        app.engine.execute("mix.record_arm", &json!({"tracks": [print], "value": true})).unwrap();
+        // Where the Bass plays.
+        let at = app.engine.session().tracks.iter().find(|t| t.name == "Bass").unwrap().clips()[0].start;
+        app.engine.execute("edit.select", &json!({"start": at})).unwrap();
+        app.engine.execute("transport.record", &json!({})).unwrap();
+        app.handle_transport(1.0 / 60.0);
+        assert!(app.engine.transport.recording, "{}", app.ui.status);
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        app.handle_transport(1.0 / 60.0);
+        app.engine.execute("transport.stop", &json!({})).unwrap();
+        app.handle_transport(1.0 / 60.0);
+        let clips = app.engine.session().track(soundcraft_model::TrackId(print)).unwrap().clips().to_vec();
+        assert_eq!(clips.len(), 1, "{}", app.ui.status);
+        assert_eq!(clips[0].start, at);
+        let soundcraft_model::ClipContent::Audio { source, .. } = clips[0].content else { panic!("an audio clip") };
+        let audio = app.engine.session().pool.get(source).expect("loaded");
+        let peak = audio.channel(0).unwrap_or_default().iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(peak > 0.01, "the take holds the Bass: peak {peak}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
