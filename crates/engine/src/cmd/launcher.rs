@@ -63,6 +63,15 @@ pub fn specs() -> Vec<CommandSpec> {
             launch(e, &[(t, Some(scene))]);
             Ok(json!({}))
         }),
+        cmd!(noundo "launcher.resume", "Resume Slot", [], None, "{track, scene, start: samples} — plays now, as if launched at `start`", always, |e, p| {
+            let (t, scene) = slot_param(e, "launcher.resume", p)?;
+            if e.session().launcher.slot(t, scene).is_none() {
+                return Err(bad("launcher.resume", "that slot is empty"));
+            }
+            let start = position_param(e, "launcher.resume", p, "start")?.ok_or_else(|| bad("launcher.resume", "`start` required"))?;
+            e.launch_requests.push(LaunchRequest::Resume { track: t, scene, start });
+            Ok(json!({}))
+        }),
         cmd!(noundo "launcher.stop", "Stop Track Slot", [], None, "{track | tracks}", always, |e, p| {
             let tracks = tracks_required(e, "launcher.stop", p)?;
             let stops: Vec<(TrackId, Option<usize>)> = tracks.into_iter().map(|t| (t, None)).collect();

@@ -109,6 +109,13 @@ enum Cmd {
     },
     /// Tracks play their launched slots (on) or the timeline (off).
     SessionMode(bool),
+    /// Plays `scene` on `track` now, as if launched at `start` (keeps a loop's phase across a
+    /// transport restart).
+    Resume {
+        track: TrackId,
+        scene: usize,
+        start: Samples,
+    },
 }
 
 /// What the clip launcher is playing and has queued, for the UI.
@@ -389,6 +396,12 @@ impl AudioState {
                         self.mix.launch.playing.clear();
                         self.launch_queue.clear();
                     }
+                    self.publish_launch();
+                }
+                Cmd::Resume { track, scene, start } => {
+                    self.launch_queue.retain(|(t, _, _)| *t != track);
+                    self.mix.launch.set(track, Some(scene), start);
+                    self.mix.launch.session_mode = true;
                     self.publish_launch();
                 }
                 Cmd::Locate(at) => {
@@ -932,6 +945,12 @@ impl Player {
         let _ = self.tx.send(Cmd::Launch { track, scene, quantize_bars });
     }
 
+    /// Plays `scene` on `track` straight away, as if launched at `start`: a loop picks up where
+    /// it was (after a transport restart, say) instead of starting over.
+    pub fn resume(&self, track: TrackId, scene: usize, start: Samples) {
+        let _ = self.tx.send(Cmd::Resume { track, scene, start });
+    }
+
     /// Tracks play their launched slots (on) or the timeline (off, which stops every slot).
     pub fn set_session_mode(&self, on: bool) {
         let _ = self.tx.send(Cmd::SessionMode(on));
@@ -1431,6 +1450,11 @@ mod tests {
         tx.send(Cmd::Stop).unwrap();
         st.fill(&mut out, 2);
         assert!(shared.launch.lock().unwrap().playing.is_empty());
+        // Restarting mid-loop and resuming keeps the loop's phase: it plays as launched at bar 2.
+        tx.send(Cmd::Play { from: 120_000, end: None, looped: None }).unwrap();
+        tx.send(Cmd::Resume { track: t, scene: 0, start: 96_000 }).unwrap();
+        st.fill(&mut out, 2);
+        assert_eq!(shared.launch.lock().unwrap().playing, vec![(t, 0, 96_000)]);
     }
 
     #[test]
