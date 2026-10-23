@@ -180,6 +180,20 @@ pub fn import_audio_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option
     Ok(json!({"track": track, "clip": cid, "source": src, "frames": frames, "channels": channels}))
 }
 
+/// Decodes an audio file into a new source (at the session's rate), without placing it anywhere.
+pub fn import_source(e: &mut Engine, path: &str) -> Result<soundcraft_model::SourceId> {
+    let bytes = read_file(path)?;
+    let name = Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("Audio").to_string();
+    let ext = Path::new(&name).extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
+    let (info, buf) = soundcraft_audio_io::decode(&bytes, ext.as_deref()).map_err(|err| EngineError::Io(format!("{name}: {err}")))?;
+    let buf = at_rate(buf, e.session().sample_rate.hz(), MAX_IMPORT_SAMPLES)
+        .ok_or_else(|| EngineError::Io(format!("{name}: file is too large to import")))?;
+    if buf.frames() == 0 {
+        return Err(EngineError::Io(format!("{name}: no audio")));
+    }
+    Ok(add_source(e.session_mut(), &name, buf, Some(path), info.format))
+}
+
 /// Loads an audio file's bytes into an instrument track's Sampler as one undo step ("Load
 /// Sampler Sample"): for files that have no path, such as one dropped into the browser. The same
 /// checks as `mix.sampler_load`; not journaled, since the bytes can be large.

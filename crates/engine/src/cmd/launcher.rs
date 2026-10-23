@@ -31,7 +31,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Audio to Slot",
             [],
             None,
-            "{source: id, track, scene, offset?: 0, length?: (to the end), name?, loop_bars?: (its length in whole bars)}",
+            "{source: id | path: audio file (imported), track, scene, offset?: 0, length?: (to the end), name?, loop_bars?: (its length in whole bars)}",
             always,
             slot_from_source
         ),
@@ -192,7 +192,15 @@ fn slot_from_clip(e: &mut Engine, p: &Value) -> Result<Value> {
 fn slot_from_source(e: &mut Engine, p: &Value) -> Result<Value> {
     const CMD: &str = "launcher.slot_from_source";
     let (t, scene) = slot_param(e, CMD, p)?;
-    let source = p.get("source").and_then(Value::as_u64).map(SourceId).ok_or_else(|| bad(CMD, "`source` id required"))?;
+    if e.session().track(t).map(|x| x.kind) != Some(soundcraft_model::TrackKind::Audio) {
+        return Err(bad(CMD, "audio goes on an audio track"));
+    }
+    // A file is imported first (one step with the slot).
+    let source = match (p.get("source").and_then(Value::as_u64), str_param(p, "path")) {
+        (Some(id), _) => SourceId(id),
+        (None, Some(path)) => crate::io::import_source(e, path)?,
+        (None, None) => return Err(bad(CMD, "`source` id or `path` required")),
+    };
     let s = e.session();
     let src = s.sources.iter().find(|x| x.id == source).ok_or_else(|| bad(CMD, format!("no source {}", source.0)))?;
     if s.track(t).map(|x| x.kind) != Some(soundcraft_model::TrackKind::Audio) {
@@ -399,5 +407,33 @@ mod tests {
 
         e.execute("edit.undo", &json!({})).unwrap();
         assert_eq!(e.session().track(kick_id).unwrap().clips(), s.track(kick_id).unwrap().clips(), "one undo step");
+    }
+
+    /// A WAV dropped on an empty slot: imported, looping, its loop whole bars at the session tempo.
+    #[test]
+    fn an_audio_file_becomes_a_looping_slot_in_one_step() {
+        let (mut e, kick) = engine();
+        e.execute("launcher.scene_add", &json!({})).unwrap();
+        let dir = std::env::temp_dir().join(format!("soundcraft-slot-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Loop 120.wav");
+        // 1.5 s of 44.1 kHz audio: resampled to the session rate, two bars long at 104 BPM.
+        let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 44_100, channels: vec![vec![0.25; 66_150]] };
+        std::fs::write(&path, soundcraft_audio_io::encode(&buf, &soundcraft_audio_io::EncodeOptions::default()).unwrap()).unwrap();
+        let sources = e.session().sources.len();
+        let r = e.execute("launcher.slot_from_source", &json!({"track": kick, "scene": 0, "path": path.to_string_lossy()})).unwrap();
+        let slot = e.session().launcher.slot(soundcraft_model::TrackId(kick), 0).unwrap().clone();
+        assert!(slot.looped && slot.loop_ticks % 3840 == 0 && slot.loop_ticks > 0, "{slot:?}");
+        assert_eq!(slot.clip.name, "Loop 120");
+        assert_eq!(e.session().sources.len(), sources + 1);
+        assert_eq!(slot.clip.length, e.session().sources.last().unwrap().frames as i64, "the whole file, at the session rate");
+        assert!(r["clip"].is_u64());
+        e.execute("edit.undo", &json!({})).unwrap();
+        assert!(e.session().launcher.slot(soundcraft_model::TrackId(kick), 0).is_none());
+        assert_eq!(e.session().sources.len(), sources, "the import goes with the same undo");
+        assert!(
+            e.execute("launcher.slot_from_source", &json!({"track": kick, "scene": 0, "path": dir.join("missing.wav").to_string_lossy()})).is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

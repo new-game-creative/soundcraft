@@ -126,9 +126,36 @@ enum Cmd {
         device: u16,
         data: [u8; 3],
     },
+    /// Audition a sound over the mix (`None`: stop).
+    Preview(Option<Arc<PreviewSound>>),
     /// The names of the open MIDI inputs, by device index.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     MidiDevices(Arc<Vec<String>>),
+}
+
+/// A sound to audition (a file in a browser, say): planar samples at `rate`, played once over
+/// the mix, also while the transport is stopped (see [`Player::preview`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreviewSound {
+    pub channels: Vec<Vec<f32>>,
+    pub rate: u32,
+}
+
+impl PreviewSound {
+    fn frames(&self) -> usize {
+        self.channels.iter().map(Vec::len).min().unwrap_or(0)
+    }
+
+    /// Frame `at` (fractional) of channel `c`, linearly interpolated.
+    fn sample(&self, c: usize, at: f64) -> f32 {
+        let Some(ch) = self.channels.get(c.min(self.channels.len().saturating_sub(1))) else { return 0.0 };
+        let i = at.floor() as usize;
+        let t = (at - at.floor()) as f32;
+        let a = ch.get(i).copied().unwrap_or(0.0);
+        let b = ch.get(i + 1).copied().unwrap_or(0.0);
+        let v = a + (b - a) * t;
+        if v.is_finite() { v } else { 0.0 }
+    }
 }
 
 /// The MIDI "device" of the computer keyboard (see [`Player::play_midi`]).
@@ -189,6 +216,8 @@ struct Shared {
     launch: Mutex<LaunchStatus>,
     /// Live MIDI played into record-enabled tracks while recording, for the UI to make clips of.
     played: Mutex<Vec<PlayedNote>>,
+    /// A sound is being auditioned.
+    previewing: AtomicBool,
 }
 
 /// What stopped the audio output.
@@ -288,6 +317,8 @@ struct AudioState {
     taps: Option<Arc<record::TapFeed>>,
     /// MIDI input names by device index.
     midi_names: Arc<Vec<String>>,
+    /// The sound being auditioned and where it is (frames at its own rate).
+    preview: Option<(Arc<PreviewSound>, f64)>,
 }
 
 fn new_engine(sr: f32) -> MixEngine {
@@ -324,8 +355,34 @@ impl AudioState {
             launch_queue: Vec::with_capacity(LAUNCH_CAPACITY),
             taps: None,
             midi_names: Arc::new(Vec::new()),
+            preview: None,
         }
         .with_launch_capacity()
+    }
+
+    /// Adds the next `n` frames of the auditioned sound to the block (resampled to the session
+    /// rate; a mono sound plays on every channel). It ends on its own at its last frame.
+    fn mix_preview(&mut self, n: usize) {
+        let Some((sound, at)) = &mut self.preview else { return };
+        let step = f64::from(sound.rate.max(1)) / self.session.sample_rate.as_f64().max(1.0);
+        let frames = sound.frames() as f64;
+        for i in 0..n {
+            let pos = *at + i as f64 * step;
+            if pos >= frames {
+                break;
+            }
+            for (c, out) in self.pending.iter_mut().enumerate() {
+                if let Some(x) = out.get_mut(i) {
+                    *x += sound.sample(c, pos);
+                }
+            }
+        }
+        *at += n as f64 * step;
+        if *at >= frames {
+            // The UI keeps the sound, so it is not freed here.
+            self.preview = None;
+            self.shared.previewing.store(false, Ordering::Relaxed);
+        }
     }
 
     /// Lists the tracks the taps record in the mix (within the reserved capacity: no allocation).
@@ -507,6 +564,10 @@ impl AudioState {
                     self.sync_tapped();
                 }
                 Cmd::MidiDevices(names) => self.midi_names = names,
+                Cmd::Preview(p) => {
+                    self.preview = p.map(|p| (p, 0.0));
+                    self.shared.previewing.store(self.preview.is_some(), Ordering::Relaxed);
+                }
                 Cmd::Midi { device, data } => self.route_midi(device, data),
             }
         }
@@ -568,6 +629,7 @@ impl AudioState {
         self.mix.recording = self.recording;
         self.mix.render(&self.session, self.pos, n, &mut self.pending);
         self.mix.live_notes.clear();
+        self.mix_preview(n);
         if self.recording
             && self.playing
             && let Some(feed) = &self.taps
@@ -613,7 +675,8 @@ impl AudioState {
         self.drain();
         let channels = channels.max(1);
         let monitoring = (self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm))
-            || self.session.tracks.iter().any(soundcraft_mix::plays_live_midi);
+            || self.session.tracks.iter().any(soundcraft_mix::plays_live_midi)
+            || self.preview.is_some();
         if !self.playing && !monitoring {
             out.iter_mut().for_each(|x| *x = 0.0);
             if let Ok(mut m) = self.shared.meters.try_lock() {
@@ -698,6 +761,8 @@ struct Side {
     refused: HashSet<(TrackId, usize)>,
     garbage: Receiver<Vec<Box<dyn Plugin>>>,
     old_sessions: Option<Receiver<Arc<Session>>>,
+    /// The sound being auditioned (the audio thread has a copy of the `Arc`).
+    preview: Option<Arc<PreviewSound>>,
     /// The takes recording inside the mix, while they record.
     taps: Option<record::TapWriter>,
     /// The open MIDI inputs.
@@ -716,6 +781,7 @@ impl Side {
             garbage,
             old_sessions: None,
             taps: None,
+            preview: None,
             #[cfg(not(target_arch = "wasm32"))]
             midi: None,
         }
@@ -815,6 +881,7 @@ impl Player {
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
             played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+            previewing: AtomicBool::new(false),
         });
         let want = session.sample_rate.hz();
         let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
@@ -1097,6 +1164,20 @@ impl Player {
         }
         #[cfg(target_arch = "wasm32")]
         Vec::new()
+    }
+
+    /// Auditions `sound` once over the mix, also while stopped (`None` stops it).
+    pub fn preview(&self, sound: Option<PreviewSound>) {
+        let sound = sound.map(Arc::new);
+        // Kept here as well, so the audio thread never frees it.
+        self.side().preview = sound.clone();
+        self.shared.previewing.store(sound.is_some(), Ordering::Relaxed);
+        let _ = self.tx.send(Cmd::Preview(sound));
+    }
+
+    /// Whether a sound is being auditioned.
+    pub fn previewing(&self) -> bool {
+        self.shared.previewing.load(Ordering::Relaxed)
     }
 
     /// Plays a MIDI message as if it came from `device` ([`KEYBOARD`] for the computer keyboard).
@@ -1497,6 +1578,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
             played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+            previewing: AtomicBool::new(false),
         };
         let fault = Fault::default();
         let mut out = [0.5f32; 8];
@@ -1540,6 +1622,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
             played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+            previewing: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -1560,6 +1643,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
             played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+            previewing: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -1586,6 +1670,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
             played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+            previewing: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let st = AudioState::new(rx, shared, Arc::new(s), 48_000.0, channel().0);
@@ -1614,6 +1699,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
             played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+            previewing: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
@@ -1669,6 +1755,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
             played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+            previewing: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
@@ -1767,6 +1854,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
             played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+            previewing: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&s), 48_000.0, channel().0);
@@ -1802,6 +1890,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
             played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+            previewing: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -1896,6 +1985,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
             played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+            previewing: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -1927,6 +2017,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
             played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+            previewing: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -1964,6 +2055,7 @@ mod tests {
                 meters: Mutex::new(MeterSnapshot::default()),
                 launch: Mutex::new(LaunchStatus::reserved()),
                 played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+                previewing: AtomicBool::new(false),
             });
             let (tx, rx) = channel();
             let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
@@ -1996,6 +2088,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
             played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+            previewing: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
@@ -2019,6 +2112,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             launch: Mutex::new(LaunchStatus::reserved()),
             played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+            previewing: AtomicBool::new(false),
         })
     }
 
@@ -2053,6 +2147,29 @@ mod tests {
         tx.send(Cmd::Midi { device: 1, data: [0x80, 60, 0] }).unwrap();
         st.drain();
         assert_eq!(*shared.played.lock().unwrap(), vec![PlayedNote { track: keys, at: 4_800, pitch: 60, velocity: 0 }]);
+    }
+
+    #[test]
+    fn a_preview_plays_over_a_stopped_transport_and_ends_by_itself() {
+        let shared = shared_for_tests();
+        let (tx, rx) = channel();
+        let mut s = soundcraft_model::Session::default();
+        s.edit.click = false;
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
+        let mut out = vec![0.0f32; 2048];
+        st.fill(&mut out, 2);
+        assert!(out.iter().all(|x| *x == 0.0), "stopped: silence");
+        // 1500 frames at 24 kHz: 3000 at the session's 48 kHz.
+        tx.send(Cmd::Preview(Some(Arc::new(PreviewSound { channels: vec![vec![0.5; 1500]], rate: 24_000 })))).unwrap();
+        st.fill(&mut out, 2);
+        assert!(shared.previewing.load(Ordering::Relaxed));
+        assert!(out.chunks(2).take(1000).all(|f| (f[0] - 0.5).abs() < 1e-4 && (f[1] - 0.5).abs() < 1e-4), "mono on both channels");
+        for _ in 0..4 {
+            st.fill(&mut out, 2);
+        }
+        assert!(!shared.previewing.load(Ordering::Relaxed), "it ends at its last frame");
+        st.fill(&mut out, 2);
+        assert!(out.iter().all(|x| *x == 0.0));
     }
 
     #[test]
