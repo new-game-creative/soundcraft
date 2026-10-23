@@ -15,7 +15,7 @@ pub(crate) struct MidiInputs {
 pub(crate) fn open(tx: &Sender<Cmd>) -> MidiInputs {
     let mut conns = Vec::new();
     let mut names = Vec::new();
-    let ports = match midir::MidiInput::new("Fluid") {
+    let ports = match midir::MidiInput::new("SoundCraft") {
         Ok(m) => m.ports(),
         Err(e) => {
             log::warn!("MIDI input: {e}");
@@ -23,13 +23,13 @@ pub(crate) fn open(tx: &Sender<Cmd>) -> MidiInputs {
         }
     };
     for port in ports {
-        let Ok(input) = midir::MidiInput::new("Fluid") else { continue };
+        let Ok(input) = midir::MidiInput::new("SoundCraft") else { continue };
         let name = input.port_name(&port).unwrap_or_else(|_| "MIDI input".into());
         let Ok(device) = u16::try_from(names.len()) else { break };
         let tx = tx.clone();
         let opened = input.connect(
             &port,
-            "fluid-in",
+            "soundcraft-in",
             move |_stamp, msg, ()| {
                 if let [status, a, b, ..] = *msg {
                     let _ = tx.send(Cmd::Midi { device, data: [status, a, b] });
