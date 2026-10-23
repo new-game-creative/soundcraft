@@ -299,20 +299,18 @@ impl AudioState {
     /// the next one (so each lands on its sample).
     fn run_launch_queue(&mut self, n: usize) -> usize {
         let pos = self.pos;
-        let mut changed = false;
         let mut i = 0;
         while let Some(&(track, scene, at)) = self.launch_queue.get(i) {
             if at <= pos {
                 self.mix.launch.set(track, scene, pos);
                 self.launch_queue.swap_remove(i);
-                changed = true;
             } else {
                 i += 1;
             }
         }
-        if changed {
-            self.publish_launch();
-        }
+        // Every block, not only on changes: a publish that finds the UI holding the lock is
+        // simply made again on the next one.
+        self.publish_launch();
         let next = self.launch_queue.iter().map(|(_, _, at)| *at).min();
         next.map_or(n, |at| n.min(usize::try_from(at - pos).unwrap_or(n).max(1)))
     }
@@ -505,6 +503,7 @@ impl AudioState {
                 m.main = StripMeter::default();
                 m.tracks.clear();
             }
+            self.publish_launch();
             return;
         }
         let speed = f64::from(self.shared.speed.load(Ordering::Relaxed)) / 1000.0;
