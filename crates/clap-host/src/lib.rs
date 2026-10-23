@@ -54,7 +54,7 @@ pub fn parse_id(id: &str) -> Option<&str> {
 }
 
 /// One plugin found by a scan.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClapDescriptor {
     /// SoundCraft id: `clap:<plugin_id>`.
     pub id: String,
@@ -102,6 +102,9 @@ mod api {
     pub fn add_search_dir(dir: &Path) -> usize {
         registry::add_search_dir(dir)
     }
+    pub fn adopt(list: Vec<ClapDescriptor>) {
+        registry::adopt(list)
+    }
     pub fn scan_paths(dirs: &[PathBuf]) -> Vec<ClapDescriptor> {
         registry::scan_paths(dirs)
     }
@@ -129,6 +132,7 @@ mod api {
     pub fn rescan() -> Vec<ClapDescriptor> {
         Vec::new()
     }
+    pub fn adopt(_list: Vec<ClapDescriptor>) {}
     pub fn add_search_dir(_dir: &Path) -> usize {
         0
     }
@@ -169,6 +173,13 @@ pub fn scan_paths(dirs: &[PathBuf]) -> Vec<ClapDescriptor> {
     api::scan_paths(dirs)
 }
 
+/// Uses `list` as the scan (replacing the cache), for a host that scanned elsewhere: in a helper
+/// process, so a plugin that crashes or hangs while loading cannot take the host with it, or from
+/// a cache of an earlier run. Instantiating then needs no scan.
+pub fn adopt(list: Vec<ClapDescriptor>) {
+    api::adopt(list)
+}
+
 /// The plugins of the last scan, without scanning: `None` until something has scanned.
 pub fn cached() -> Option<Vec<ClapDescriptor>> {
     api::cached()
@@ -206,6 +217,27 @@ pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_adopted_scan_round_trips_through_json_and_becomes_the_cache() {
+        let d = ClapDescriptor {
+            id: "clap:com.acme.synth".into(),
+            plugin_id: "com.acme.synth".into(),
+            name: "Synth".into(),
+            vendor: "Acme".into(),
+            version: "1.0".into(),
+            description: String::new(),
+            features: vec!["instrument".into()],
+            category: Category::Instrument,
+            is_instrument: true,
+            path: "/nowhere/Synth.clap".into(),
+        };
+        let back: Vec<ClapDescriptor> = serde_json::from_str(&serde_json::to_string(&vec![d.clone()]).unwrap()).unwrap();
+        adopt(back);
+        assert_eq!(cached(), Some(vec![d]));
+        assert!(instantiate("clap:com.acme.synth").is_err());
+    }
 
     #[test]
     fn ids_parse() {

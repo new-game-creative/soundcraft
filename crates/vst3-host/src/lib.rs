@@ -78,7 +78,7 @@ pub fn parse_id(id: &str) -> Option<[u8; 16]> {
 }
 
 /// One plugin found by a scan.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Vst3Descriptor {
     /// SoundCraft id: `vst3:<class_id>`.
     pub id: String,
@@ -128,6 +128,9 @@ mod api {
     pub fn add_search_dir(dir: &Path) -> usize {
         registry::add_search_dir(dir)
     }
+    pub fn adopt(list: Vec<Vst3Descriptor>) {
+        registry::adopt(list)
+    }
     pub fn scan_paths(dirs: &[PathBuf]) -> Vec<Vst3Descriptor> {
         registry::scan_paths(dirs)
     }
@@ -158,6 +161,7 @@ mod api {
     pub fn rescan() -> Vec<Vst3Descriptor> {
         Vec::new()
     }
+    pub fn adopt(_list: Vec<Vst3Descriptor>) {}
     pub fn add_search_dir(_dir: &Path) -> usize {
         0
     }
@@ -197,6 +201,13 @@ pub fn add_search_dir(dir: &Path) -> usize {
 /// Scans the given folders without touching the cache.
 pub fn scan_paths(dirs: &[PathBuf]) -> Vec<Vst3Descriptor> {
     api::scan_paths(dirs)
+}
+
+/// Uses `list` as the scan (replacing the cache), for a host that scanned elsewhere: in a helper
+/// process, so a plugin that crashes or hangs while loading cannot take the host with it, or from
+/// a cache of an earlier run. Instantiating then needs no scan.
+pub fn adopt(list: Vec<Vst3Descriptor>) {
+    api::adopt(list)
 }
 
 /// The plugins of the last scan, without scanning: `None` until something has scanned.
@@ -252,6 +263,28 @@ pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_adopted_scan_round_trips_through_json_and_becomes_the_cache() {
+        let d = Vst3Descriptor {
+            id: "vst3:0123456789ABCDEF0123456789ABCDEF".into(),
+            class_id: "0123456789ABCDEF0123456789ABCDEF".into(),
+            name: "Synth".into(),
+            vendor: "Acme".into(),
+            version: "1.0".into(),
+            sdk_version: "VST 3.7".into(),
+            sub_categories: vec!["Instrument".into(), "Synth".into()],
+            category: Category::Instrument,
+            is_instrument: true,
+            path: "/nowhere/Synth.vst3".into(),
+        };
+        let back: Vec<Vst3Descriptor> = serde_json::from_str(&serde_json::to_string(&vec![d.clone()]).unwrap()).unwrap();
+        adopt(back);
+        assert_eq!(cached(), Some(vec![d]));
+        // Instantiating a listed plugin whose file is gone is an error, not a scan or a crash.
+        assert!(instantiate("vst3:0123456789ABCDEF0123456789ABCDEF").is_err());
+    }
 
     #[test]
     fn ids_parse() {

@@ -58,3 +58,6 @@ dbg_macro = "warn"
 todo = "warn"
 too_many_arguments = "allow"
 type_complexity = "allow"
+
+[dev-dependencies]
+serde_json.workspace = true

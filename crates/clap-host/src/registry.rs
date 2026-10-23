@@ -94,6 +94,12 @@ pub fn rescan() -> Vec<ClapDescriptor> {
     ensure_scanned(&mut r).clone()
 }
 
+pub fn adopt(list: Vec<ClapDescriptor>) {
+    let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
+    r.scanned = Some(list);
+    r.failed.clear();
+}
+
 pub fn add_search_dir(dir: &Path) -> usize {
     let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
     if !r.extra_dirs.iter().any(|d| d == dir) {
