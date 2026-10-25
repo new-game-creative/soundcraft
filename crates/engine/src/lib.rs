@@ -82,6 +82,9 @@ pub enum LaunchRequest {
     SessionMode(bool),
     /// Play `scene` on `track` now, as if launched at `start` (a loop keeps its phase).
     Resume { track: TrackId, scene: usize, start: soundcraft_time::Samples },
+    /// Start `scene` on `track` when the slot it plays ends its current loop pass (at the next
+    /// multiple of `quantize_bars` when it plays nothing).
+    LaunchNext { track: TrackId, scene: usize, quantize_bars: f64 },
 }
 
 /// Snapshot of the transport reported back by the host (playback position etc.).

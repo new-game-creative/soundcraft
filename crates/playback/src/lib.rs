@@ -120,6 +120,13 @@ enum Cmd {
         scene: usize,
         start: Samples,
     },
+    /// Launch `scene` on `track` at the end of the playing slot's current loop pass (or at the
+    /// next multiple of `quantize_bars` when the track plays nothing).
+    LaunchNext {
+        track: TrackId,
+        scene: usize,
+        quantize_bars: f64,
+    },
     /// Takes recording inside the mix (`None`: stop feeding them).
     Taps(Option<Arc<record::TapFeed>>),
     /// A live MIDI message from input `device` (an index into [`Cmd::MidiDevices`], or
@@ -434,6 +441,16 @@ impl AudioState {
         }
     }
 
+    /// Where the slot `track` plays ends its current loop pass, while the transport runs.
+    fn pass_end(&self, track: TrackId) -> Option<Samples> {
+        if !self.playing {
+            return None;
+        }
+        let (scene, start) = self.mix.launch.playing(track)?;
+        let slot = self.session.launcher.slot(track, scene)?;
+        soundcraft_mix::launch_iteration(&self.session, slot, start, self.pos.max(start)).map(|(_, end)| end)
+    }
+
     /// A note on or off for `track` alone, when it plays live MIDI (armed or monitoring).
     fn track_midi(&mut self, track: TrackId, data: [u8; 3]) {
         let (status, pitch, vel) = (data[0] & 0xF0, data[1] & 0x7F, data[2] & 0x7F);
@@ -576,6 +593,15 @@ impl AudioState {
                 Cmd::Resume { track, scene, start } => {
                     self.launch_queue.retain(|(t, _, _, _)| *t != track);
                     self.mix.launch.set(track, Some(scene), start);
+                    self.mix.launch.session_mode = true;
+                    self.publish_launch();
+                }
+                Cmd::LaunchNext { track, scene, quantize_bars } => {
+                    let at = self.pass_end(track).unwrap_or_else(|| self.launch_time(quantize_bars));
+                    self.launch_queue.retain(|(t, _, _, _)| *t != track);
+                    if self.launch_queue.len() < LAUNCH_CAPACITY {
+                        self.launch_queue.push((track, Some(scene), at, false));
+                    }
                     self.mix.launch.session_mode = true;
                     self.publish_launch();
                 }
@@ -1252,6 +1278,14 @@ impl Player {
         let _ = self.tx.send(Cmd::Resume { track, scene, start });
     }
 
+    /// Launches `scene` on `track` exactly where the slot it plays ends its current loop pass
+    /// (pattern chains, "switch at the end of the loop"); at the next multiple of `quantize_bars`
+    /// when it plays nothing.
+    pub fn launch_next(&self, track: TrackId, scene: usize, quantize_bars: f64) {
+        let quantize_bars = if quantize_bars.is_finite() { quantize_bars.clamp(0.0, 16.0) } else { 1.0 };
+        let _ = self.tx.send(Cmd::LaunchNext { track, scene, quantize_bars });
+    }
+
     /// Tracks play their launched slots (on) or the timeline (off, which stops every slot).
     pub fn set_session_mode(&self, on: bool) {
         let _ = self.tx.send(Cmd::SessionMode(on));
@@ -1769,6 +1803,53 @@ mod tests {
         run_to(&mut st, &mut played, 80_000);
         assert!(played.get(72_000).is_some_and(|v| (v / gain - 0.5).abs() < 1e-4));
         assert_eq!(shared.launch.lock().unwrap().playing, vec![(t, 0, 72_000)]);
+    }
+
+    #[test]
+    fn launch_next_starts_where_the_playing_slot_ends_its_pass() {
+        use soundcraft_model::{ChannelFormat, Clip, LaunchSlot, SourceAudio, SourceId, TrackKind};
+        // 120 BPM 4/4 at 48 kHz: a bar is 96 000 samples. A is 1.5 bars, B a steady 0.25.
+        let mut s = Session::default();
+        s.edit.click = false;
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let buf = |v: f32| Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![v; 192_000]] }));
+        s.pool.insert(SourceId(5), buf(0.5));
+        s.pool.insert(SourceId(6), buf(0.25));
+        s.launcher.insert_scene(0, "A".into());
+        s.launcher.insert_scene(1, "B".into());
+        for (scene, src, ticks) in [(0, 5, 5760), (1, 6, 3840)] {
+            let id = s.new_clip_id();
+            s.launcher.set_slot(t, scene, Some(LaunchSlot::new(Clip::audio(id, "loop", SourceId(src), 0, 0, 192_000), ticks))).unwrap();
+        }
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+            launch: Mutex::new(LaunchStatus::reserved()),
+            played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+            previewing: AtomicBool::new(false),
+        });
+        let (tx, rx) = channel();
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        tx.send(Cmd::Launch { track: t, scene: Some(0), quantize_bars: 0.0, legato: false }).unwrap();
+        let mut out = vec![0.0f32; 2 * 500];
+        let mut played = Vec::new();
+        while played.len() < 20_000 {
+            st.fill(&mut out, 2);
+            played.extend(out.iter().step_by(2).copied());
+        }
+        // Queued a bar quantize would put at 96 000; next-pass puts it at A's end, 144 000.
+        tx.send(Cmd::LaunchNext { track: t, scene: 1, quantize_bars: 1.0 }).unwrap();
+        while played.len() < 150_000 {
+            st.fill(&mut out, 2);
+            played.extend(out.iter().step_by(2).copied());
+        }
+        let a = played.get(143_999).copied().unwrap_or(0.0);
+        let b = played.get(144_000).copied().unwrap_or(0.0);
+        assert!(a > 0.0 && (b / a - 0.5).abs() < 1e-4, "A to 143 999 ({a}), B from 144 000 ({b})");
+        assert_eq!(shared.launch.lock().unwrap().playing, vec![(t, 1, 144_000)]);
     }
 
     #[test]

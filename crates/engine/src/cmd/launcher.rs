@@ -90,6 +90,18 @@ pub fn specs() -> Vec<CommandSpec> {
             launch(e, &[(t, Some(scene))], true);
             Ok(json!({}))
         }),
+        cmd!(noundo "launcher.launch_next", "Launch Slot Next", [], None, "{track, scene} — starts when the track's playing slot ends its loop pass (at the track's quantize when it plays nothing)", always, |e, p| {
+            let (t, scene) = slot_param(e, "launcher.launch_next", p)?;
+            if e.session().launcher.slot(t, scene).is_none() {
+                return Err(bad("launcher.launch_next", "that slot is empty"));
+            }
+            if !e.transport.playing && !e.transport_requests.contains(&TransportRequest::Play) {
+                e.transport_requests.push(TransportRequest::Play);
+            }
+            let quantize_bars = e.session().launcher.quantize_for(t);
+            e.launch_requests.push(LaunchRequest::LaunchNext { track: t, scene, quantize_bars });
+            Ok(json!({}))
+        }),
         cmd!(noundo "launcher.resume", "Resume Slot", [], None, "{track, scene, start: samples} — plays now, as if launched at `start`", always, |e, p| {
             let (t, scene) = slot_param(e, "launcher.resume", p)?;
             if e.session().launcher.slot(t, scene).is_none() {
