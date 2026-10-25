@@ -28,6 +28,10 @@ const KNOWN_UNREACHED: &[&str] = &[
     "launcher.stop",
     "launcher.stop_all",
     "launcher.to_timeline",
+    "launcher.track_launch",
+    // Drum Pads has no editor window in this UI yet (a pad grid would drive these).
+    "mix.pad_clear",
+    "mix.pad_load",
     "edit.paste_clip_effects",
     "edit.paste_clip_gain",
     "event.midi_note",

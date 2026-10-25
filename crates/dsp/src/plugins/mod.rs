@@ -5,6 +5,7 @@ pub mod dynamics;
 pub mod eq;
 pub mod harmonic;
 pub mod modulation;
+pub mod pads;
 pub mod pitch;
 pub mod reverb;
 pub mod sampler;
@@ -42,6 +43,7 @@ pub(crate) static REGISTRY: &[&PluginInfo] = &[
     &utility::DITHER_INFO,
     &synth::SYNTH_INFO,
     &drums::DRUM_INFO,
+    &pads::PADS_INFO,
     &sampler::SAMPLER_INFO,
 ];
 
@@ -74,6 +76,7 @@ pub(crate) fn instantiate(id: &str) -> Option<Box<dyn Plugin>> {
         "dither" => Box::new(utility::Dither::new()),
         "subtractive_synth" => Box::new(synth::SubtractiveSynth::new()),
         "drum_synth" => Box::new(drums::DrumSynth::new()),
+        "drum_pads" => Box::new(pads::DrumPads::new()),
         "sampler" => Box::new(sampler::Sampler::new()),
         _ => return None,
     })

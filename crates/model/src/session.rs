@@ -568,6 +568,9 @@ impl Session {
         truncate_chars(&mut self.comments, MAX_COMMENT_CHARS);
         for t in &mut self.tracks {
             t.mixer.sanitize();
+            if let Some(i) = t.instrument.as_mut() {
+                i.pads.truncate(crate::mixer::MAX_PADS);
+            }
             truncate_chars(&mut t.name, MAX_NAME_CHARS);
             truncate_chars(&mut t.comments, MAX_COMMENT_CHARS);
             if t.playlists.is_empty() {

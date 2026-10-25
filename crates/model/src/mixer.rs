@@ -464,7 +464,14 @@ pub struct Insert {
     /// The session audio source a sample-playing instrument (the built-in Sampler) plays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample: Option<SourceId>,
+    /// The session audio sources a multi-sample instrument (Drum Pads) plays, by pad (index 0 =
+    /// pad 1); `None` for an empty pad.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pads: Vec<Option<SourceId>>,
 }
+
+/// Most pads an insert keeps samples for.
+pub const MAX_PADS: usize = 128;
 
 fn yes() -> bool {
     true
@@ -480,7 +487,30 @@ impl Insert {
             preset: String::from("<factory default>"),
             state: None,
             sample: None,
+            pads: Vec::new(),
         }
+    }
+
+    /// The source pad `pad` (0-based) plays.
+    pub fn pad(&self, pad: usize) -> Option<SourceId> {
+        self.pads.get(pad).copied().flatten()
+    }
+
+    /// Sets (or clears) pad `pad`'s source, growing the list; `false` past [`MAX_PADS`].
+    pub fn set_pad(&mut self, pad: usize, source: Option<SourceId>) -> bool {
+        if pad >= MAX_PADS {
+            return false;
+        }
+        if self.pads.len() <= pad {
+            self.pads.resize(pad + 1, None);
+        }
+        if let Some(slot) = self.pads.get_mut(pad) {
+            *slot = source;
+        }
+        while self.pads.last().is_some_and(Option::is_none) {
+            self.pads.pop();
+        }
+        true
     }
 
     /// The decoded plugin state (`None` when absent or malformed).

@@ -426,6 +426,8 @@ fn import_session_data(e: &mut Engine, p: &Value) -> Result<Value> {
         picked.iter().flat_map(|t| t.playlists.iter().flat_map(|pl| pl.clips.iter().filter_map(|c| c.source()))).collect();
     // A Sampler's sample is session audio too.
     needed.extend(picked.iter().filter_map(|t| t.instrument.as_ref().and_then(|i| i.sample)));
+    // So are Drum Pads' pad samples.
+    needed.extend(picked.iter().filter_map(|t| t.instrument.as_ref()).flat_map(|i| i.pads.iter().flatten().copied()));
     needed.sort_by_key(|x| x.0);
     needed.dedup();
     let sr = e.session().sample_rate.hz();
@@ -479,6 +481,9 @@ fn import_session_data(e: &mut Engine, p: &Value) -> Result<Value> {
         // The donor's source ids mean nothing here: remap the sample, or drop it when it didn't come along.
         if let Some(ins) = tr.instrument.as_mut() {
             ins.sample = ins.sample.and_then(|sid| map.get(&sid.0).copied());
+            for pad in &mut ins.pads {
+                *pad = pad.and_then(|sid| map.get(&sid.0).copied());
+            }
         }
         // Busses are matched by name (created when missing).
         let remap = |s: &mut Session, r: &Route| -> Route {

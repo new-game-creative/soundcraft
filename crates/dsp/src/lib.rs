@@ -229,6 +229,11 @@ pub trait Plugin: Send {
     fn set_sample(&mut self, _sample: Option<Arc<dyn SampleSource>>) -> bool {
         false
     }
+    /// Multi-sample instruments (Drum Pads): the audio pad `pad` (0-based) plays, `None` to
+    /// clear it. `false` when the plugin has no such pad. Same rules as [`Plugin::set_sample`].
+    fn set_pad_sample(&mut self, _pad: usize, _sample: Option<Arc<dyn SampleSource>>) -> bool {
+        false
+    }
     /// The plugin's complete internal state as an opaque blob (third-party plugins), as its
     /// [`Plugin::state_reader`] reads it. `None` when the plugin has no state beyond its
     /// parameters (built-ins) or the plugin refused. May allocate: never call it in steady-state
@@ -401,6 +406,8 @@ mod trait_default_tests {
             let s: Arc<dyn SampleSource> = Arc::new(SampleBuffer { sample_rate: 48_000.0, channels: vec![vec![0.0; 16]] });
             assert_eq!(p.set_sample(Some(s)), info.id == "sampler", "{}", info.id);
             assert_eq!(p.set_sample(None), info.id == "sampler", "{}", info.id);
+            let s: Arc<dyn SampleSource> = Arc::new(SampleBuffer { sample_rate: 48_000.0, channels: vec![vec![0.0; 16]] });
+            assert_eq!(p.set_pad_sample(0, Some(s)), info.id == "drum_pads", "{}", info.id);
         }
     }
 

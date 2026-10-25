@@ -227,6 +227,8 @@ struct Strip {
     instrument: Option<PluginSlot>,
     /// The pool audio handed to the instrument with `set_sample` (sample-playing instruments).
     sample: Option<Arc<SourceAudio>>,
+    /// The pool audio handed to each pad with `set_pad_sample` (multi-sample instruments).
+    pads: Vec<Option<Arc<SourceAudio>>>,
     /// MIDI notes currently sounding on the instrument (pitch), for note-offs at stops/seek.
     held: Vec<u8>,
     /// The instrument's next block starts somewhere new: send it the controllers in effect there.
@@ -315,6 +317,7 @@ impl Strip {
             plugins: Vec::new(),
             instrument: None,
             sample: None,
+            pads: Vec::new(),
             held: Vec::new(),
             chase: true,
             muted: false,
@@ -592,8 +595,10 @@ impl MixEngine {
                 cx.retire(old);
                 strip.instrument = want.and_then(|i| cx.make(t.id, INSTRUMENT_SLOT, i, ich));
                 strip.sample = None;
+                strip.pads.clear();
             }
             sync_sample(strip, want, s);
+            sync_pads(strip, want, s);
         }
         // Instances nobody claimed (the session changed again before they arrived).
         let leftovers: Vec<(TrackId, usize)> = cx.adopt.keys().copied().collect();
@@ -1349,6 +1354,10 @@ fn structure_fingerprint(s: &Session) -> usize {
         sample.hash(&mut h);
         // Which decoded audio it is, so new audio under the same id (another session) re-syncs.
         sample.and_then(|id| s.pool.get(id)).map(|a| Arc::as_ptr(a) as usize).hash(&mut h);
+        for pad in t.instrument.iter().flat_map(|x| x.pads.iter()) {
+            pad.hash(&mut h);
+            pad.and_then(|id| s.pool.get(id)).map(|a| Arc::as_ptr(a) as usize).hash(&mut h);
+        }
     }
     for b in &s.busses {
         b.id.hash(&mut h);
@@ -1765,6 +1774,34 @@ fn sync_sample(strip: &mut Strip, want: Option<&soundcraft_model::Insert>, s: &S
         inst.plugin.set_sample(shared);
     }
     strip.sample = audio.cloned();
+}
+
+/// Hands each pad of a strip's instrument the audio of its insert's pad source when it changed.
+/// Runs on document changes only (it may allocate then, never in steady state).
+fn sync_pads(strip: &mut Strip, want: Option<&soundcraft_model::Insert>, s: &Session) {
+    let n = want.map_or(0, |i| i.pads.len()).max(strip.pads.len());
+    for pad in 0..n {
+        let audio = want.and_then(|i| i.pad(pad)).and_then(|id| s.pool.get(id));
+        let had = strip.pads.get(pad).and_then(Option::as_ref);
+        let same = match (had, audio) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            continue;
+        }
+        if let Some(inst) = strip.instrument.as_mut() {
+            let shared = audio.map(|a| Arc::new(PoolSample(Arc::clone(a))) as Arc<dyn SampleSource>);
+            inst.plugin.set_pad_sample(pad, shared);
+        }
+        if strip.pads.len() <= pad {
+            strip.pads.resize(pad + 1, None);
+        }
+        if let Some(slot) = strip.pads.get_mut(pad) {
+            *slot = audio.cloned();
+        }
+    }
 }
 
 /// Record insert latency without processing audio, so this block can compensate for it.
