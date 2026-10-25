@@ -50,6 +50,15 @@ pub fn specs() -> Vec<CommandSpec> {
             slot_set
         ),
         cmd!(
+            "launcher.slot_notes",
+            "Slot Notes",
+            [],
+            None,
+            "{track, scene, notes: [{pitch, start: ticks, length?: ticks (a sixteenth), velocity?: 100}], loop_bars?: (the slot's, or 1), name?} — the slot's MIDI clip plays these notes; an empty slot gets a new MIDI clip",
+            always,
+            slot_notes
+        ),
+        cmd!(
             "launcher.to_timeline",
             "Slot to Timeline",
             [],
@@ -306,6 +315,64 @@ fn to_timeline(e: &mut Engine, p: &Value) -> Result<Value> {
     Ok(json!({"clips": ids}))
 }
 
+/// Most notes `launcher.slot_notes` takes.
+const MAX_SLOT_NOTES: usize = 65_536;
+/// The engine's slowest tempo: a MIDI slot's clip covers its loop down to it, so a tempo change
+/// never cuts the loop short (the loop's end cuts the clip as usual).
+const SLOWEST_BPM: f64 = 5.0;
+
+fn slot_notes(e: &mut Engine, p: &Value) -> Result<Value> {
+    const CMD: &str = "launcher.slot_notes";
+    let (t, scene) = slot_param(e, CMD, p)?;
+    let kind = e.session().track(t).map(|x| x.kind);
+    if !matches!(kind, Some(soundcraft_model::TrackKind::Midi | soundcraft_model::TrackKind::Instrument)) {
+        return Err(bad(CMD, "MIDI notes go on MIDI and instrument tracks"));
+    }
+    let list = p.get("notes").and_then(Value::as_array).ok_or_else(|| bad(CMD, "`notes` (array) required"))?;
+    if list.len() > MAX_SLOT_NOTES {
+        return Err(bad(CMD, format!("{MAX_SLOT_NOTES} notes at most")));
+    }
+    let sixteenth = TICKS_PER_QUARTER / 4;
+    let mut sequence = soundcraft_midi::Sequence::default();
+    for n in list {
+        let pitch = n.get("pitch").and_then(Value::as_u64).filter(|v| *v <= 127).ok_or_else(|| bad(CMD, "each note needs a `pitch` 0-127"))?;
+        let start = n
+            .get("start")
+            .and_then(Value::as_i64)
+            .filter(|v| (0..=MAX_LOOP_TICKS).contains(v))
+            .ok_or_else(|| bad(CMD, "each note needs a `start` in ticks"))?;
+        let length = n.get("length").and_then(Value::as_i64).unwrap_or(sixteenth).clamp(1, MAX_LOOP_TICKS);
+        let velocity = n.get("velocity").and_then(Value::as_u64).unwrap_or(100).clamp(1, 127);
+        sequence.notes.push(soundcraft_midi::Note { pitch: pitch as u8, velocity: velocity as u8, release_velocity: 64, channel: 0, start, length });
+    }
+    sequence.sort();
+    let existing = e.session().launcher.slot(t, scene).map(|s| s.loop_ticks);
+    let ticks =
+        if p.get("loop_bars").is_some() { loop_ticks(e, p, 0) } else { existing.unwrap_or_else(|| loop_ticks(e, &json!({"loop_bars": 1}), 0)) };
+    let sr = e.session().sample_rate;
+    let length = ((ticks as f64 / TICKS_PER_QUARTER as f64) * 60.0 / SLOWEST_BPM * sr.as_f64()).ceil() as i64;
+    let name = str_param(p, "name").filter(|n| !n.trim().is_empty()).map(str::to_string);
+    let s = e.session_mut();
+    match s.launcher.slot_mut(t, scene) {
+        Some(slot) => {
+            let ClipContent::Midi { sequence: seq } = &mut slot.clip.content else { return Err(bad(CMD, "that slot holds audio")) };
+            *seq = sequence;
+            slot.loop_ticks = ticks;
+            slot.clip.length = slot.clip.length.max(length);
+            if let Some(name) = name {
+                slot.clip.name = name;
+            }
+        }
+        None => {
+            let id = s.new_clip_id();
+            let clip = Clip::midi(id, name.unwrap_or_else(|| "MIDI".into()), 0, length, sequence);
+            s.launcher.set_slot(t, scene, Some(LaunchSlot::new(clip, ticks))).ok_or_else(|| bad(CMD, "no such scene"))?;
+        }
+    }
+    let n = list.len();
+    Ok(json!({"notes": n, "loop_ticks": ticks}))
+}
+
 fn slot_set(e: &mut Engine, p: &Value) -> Result<Value> {
     const CMD: &str = "launcher.slot_set";
     let (t, scene) = slot_param(e, CMD, p)?;
@@ -352,6 +419,7 @@ fn slot_set(e: &mut Engine, p: &Value) -> Result<Value> {
 mod tests {
     use crate::{Engine, LaunchRequest};
     use serde_json::json;
+    use soundcraft_model::ClipContent;
 
     fn engine() -> (Engine, u64) {
         let e = crate::demo::demo_engine();
@@ -398,6 +466,40 @@ mod tests {
         let before = e.session().launcher.clone();
         e.execute("edit.undo", &json!({})).unwrap();
         assert_ne!(e.session().launcher.quantize_bars, before.quantize_bars);
+    }
+
+    #[test]
+    fn slot_notes_make_and_rewrite_a_midi_slot() {
+        let mut e = Engine::default();
+        e.execute("track.new", &json!({"kind": "instrument"})).unwrap();
+        let t = e.session().tracks.last().unwrap().id;
+        e.execute("launcher.scene_add", &json!({})).unwrap();
+        let notes = json!([{"pitch": 36, "start": 0, "velocity": 120}, {"pitch": 38, "start": 960}]);
+        let r = e.execute("launcher.slot_notes", &json!({"track": t.0, "scene": 0, "notes": notes, "loop_bars": 2, "name": "Pattern A"})).unwrap();
+        assert_eq!(r["notes"], 2);
+        let slot = e.session().launcher.slot(t, 0).unwrap().clone();
+        assert_eq!((slot.clip.name.as_str(), slot.loop_ticks), ("Pattern A", 2 * 3840));
+        let ClipContent::Midi { sequence } = &slot.clip.content else { panic!("a MIDI clip") };
+        assert_eq!(
+            sequence.notes.iter().map(|n| (n.pitch, n.start, n.velocity, n.length)).collect::<Vec<_>>(),
+            vec![(36, 0, 120, 240), (38, 960, 100, 240)]
+        );
+        // The clip covers the loop even at the slowest tempo.
+        assert!(slot.clip.length >= e.session().tempo.tick_to_samples(2 * 3840, e.session().sample_rate) * 4);
+        // Rewriting keeps the loop and the name; undo brings the first notes back.
+        e.execute("launcher.slot_notes", &json!({"track": t.0, "scene": 0, "notes": []})).unwrap();
+        let slot = e.session().launcher.slot(t, 0).unwrap();
+        assert_eq!((slot.loop_ticks, slot.clip.name.as_str()), (2 * 3840, "Pattern A"));
+        assert!(matches!(&slot.clip.content, ClipContent::Midi { sequence } if sequence.notes.is_empty()));
+        e.execute("edit.undo", &json!({})).unwrap();
+        assert!(matches!(&e.session().launcher.slot(t, 0).unwrap().clip.content, ClipContent::Midi { sequence } if sequence.notes.len() == 2));
+        // Bad notes and audio tracks are refused.
+        for bad in [json!([{"pitch": 128, "start": 0}]), json!([{"pitch": 36}]), json!([{"pitch": 36, "start": -1}]), json!("x")] {
+            assert!(e.execute("launcher.slot_notes", &json!({"track": t.0, "scene": 0, "notes": bad})).is_err());
+        }
+        e.execute("track.new", &json!({"kind": "audio"})).unwrap();
+        let audio = e.session().tracks.last().unwrap().id;
+        assert!(e.execute("launcher.slot_notes", &json!({"track": audio.0, "scene": 0, "notes": []})).is_err());
     }
 
     #[test]

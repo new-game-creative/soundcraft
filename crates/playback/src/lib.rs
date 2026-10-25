@@ -128,6 +128,11 @@ enum Cmd {
         device: u16,
         data: [u8; 3],
     },
+    /// A note played straight into `track` (an on-screen keyboard or pad), whatever its input.
+    TrackMidi {
+        track: TrackId,
+        data: [u8; 3],
+    },
     /// Audition a sound over the mix (`None`: stop).
     Preview(Option<Arc<PreviewSound>>),
     /// The names of the open MIDI inputs, by device index.
@@ -429,6 +434,20 @@ impl AudioState {
         }
     }
 
+    /// A note on or off for `track` alone, when it plays live MIDI (armed or monitoring).
+    fn track_midi(&mut self, track: TrackId, data: [u8; 3]) {
+        let (status, pitch, vel) = (data[0] & 0xF0, data[1] & 0x7F, data[2] & 0x7F);
+        let velocity = match status {
+            0x90 => vel,
+            0x80 => 0,
+            _ => return,
+        };
+        let plays = self.session.track(track).is_some_and(soundcraft_mix::plays_live_midi);
+        if plays && self.mix.live_notes.len() < soundcraft_mix::LIVE_NOTES {
+            self.mix.live_notes.push(soundcraft_mix::LiveNote { track, offset: 0, pitch, velocity });
+        }
+    }
+
     fn with_launch_capacity(mut self) -> Self {
         self.mix.launch.playing.reserve(LAUNCH_CAPACITY);
         self.mix.tapped.reserve(64);
@@ -576,6 +595,7 @@ impl AudioState {
                     self.shared.previewing.store(self.preview.is_some(), Ordering::Relaxed);
                 }
                 Cmd::Midi { device, data } => self.route_midi(device, data),
+                Cmd::TrackMidi { track, data } => self.track_midi(track, data),
             }
         }
         if changed {
@@ -1190,6 +1210,12 @@ impl Player {
     /// Plays a MIDI message as if it came from `device` ([`KEYBOARD`] for the computer keyboard).
     pub fn play_midi(&self, device: u16, data: [u8; 3]) {
         let _ = self.tx.send(Cmd::Midi { device, data });
+    }
+
+    /// Plays a note on or off straight into `track` (on-screen pads and keyboards), whatever MIDI
+    /// device it listens to. The track must play live MIDI: armed or monitoring.
+    pub fn play_note(&self, track: TrackId, data: [u8; 3]) {
+        let _ = self.tx.send(Cmd::TrackMidi { track, data });
     }
 
     /// The live notes played into record-enabled tracks while recording since the last call.
