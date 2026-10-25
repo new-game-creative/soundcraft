@@ -76,7 +76,8 @@ pub enum TransportRequest {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum LaunchRequest {
     /// Start `scene` on `track` (stop it with `None`) at the next multiple of `quantize_bars`.
-    Launch { track: TrackId, scene: Option<usize>, quantize_bars: f64 },
+    /// With `legato`, a slot replacing one that plays keeps that slot's loop position.
+    Launch { track: TrackId, scene: Option<usize>, quantize_bars: f64, legato: bool },
     /// Tracks play their launched slots (true) or the timeline (false).
     SessionMode(bool),
     /// Play `scene` on `track` now, as if launched at `start` (a loop keeps its phase).

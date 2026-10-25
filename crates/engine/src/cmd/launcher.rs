@@ -5,7 +5,7 @@
 use super::*;
 use crate::{LaunchRequest, TransportRequest, cmd};
 use serde_json::json;
-use soundcraft_model::{Clip, ClipContent, LaunchSlot, MAX_LOOP_TICKS, SourceId, TrackId};
+use soundcraft_model::{Clip, ClipContent, LaunchMode, LaunchSlot, MAX_LOOP_TICKS, SourceId, TrackId};
 use soundcraft_time::TICKS_PER_QUARTER;
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -64,12 +64,21 @@ pub fn specs() -> Vec<CommandSpec> {
             e.session_mut().launcher.quantize_bars = bars;
             Ok(json!({"bars": bars}))
         }),
+        cmd!(
+            "launcher.track_launch",
+            "Track Launch Settings",
+            [],
+            None,
+            "{track, mode?: \"restart\" | \"legato\", quantize?: \"song\" | bars (0 = none, 0.125 … 16)}",
+            always,
+            track_launch
+        ),
         cmd!(noundo "launcher.launch", "Launch Slot", [], None, "{track, scene}", always, |e, p| {
             let (t, scene) = slot_param(e, "launcher.launch", p)?;
             if e.session().launcher.slot(t, scene).is_none() {
                 return Err(bad("launcher.launch", "that slot is empty"));
             }
-            launch(e, &[(t, Some(scene))]);
+            launch(e, &[(t, Some(scene))], true);
             Ok(json!({}))
         }),
         cmd!(noundo "launcher.resume", "Resume Slot", [], None, "{track, scene, start: samples} — plays now, as if launched at `start`", always, |e, p| {
@@ -84,7 +93,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(noundo "launcher.stop", "Stop Track Slot", [], None, "{track | tracks}", always, |e, p| {
             let tracks = tracks_required(e, "launcher.stop", p)?;
             let stops: Vec<(TrackId, Option<usize>)> = tracks.into_iter().map(|t| (t, None)).collect();
-            launch(e, &stops);
+            launch(e, &stops, false);
             Ok(json!({}))
         }),
         cmd!(noundo "launcher.launch_scene", "Launch Scene", [], None, "{scene} — every track with a slot in it launches it; the others stop", always, |e, p| {
@@ -92,12 +101,13 @@ pub fn specs() -> Vec<CommandSpec> {
             let s = e.session();
             let changes: Vec<(TrackId, Option<usize>)> =
                 s.launcher.rows.iter().map(|r| (r.track, r.slots.get(scene).and_then(Option::as_ref).map(|_| scene))).collect();
-            launch(e, &changes);
+            // Scenes start from the top, whatever the tracks' launch modes.
+            launch(e, &changes, false);
             Ok(json!({"tracks": changes.len()}))
         }),
         cmd!(noundo "launcher.stop_all", "Stop All Slots", [], None, "{}", always, |e, _| {
             let stops: Vec<(TrackId, Option<usize>)> = e.session().launcher.rows.iter().map(|r| (r.track, None)).collect();
-            launch(e, &stops);
+            launch(e, &stops, false);
             Ok(json!({}))
         }),
         cmd!(noundo "launcher.session_mode", "Session Mode", [], None, "{value: bool} — tracks play their launched slots (true) or the timeline (false)", always, |e, p| {
@@ -108,16 +118,45 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
-/// Queues launches (scene) and stops (`None`) at the current quantize; starts the transport when
-/// it is stopped, so they begin at once.
-fn launch(e: &mut Engine, changes: &[(TrackId, Option<usize>)]) {
-    let quantize_bars = e.session().launcher.quantize_bars;
+/// Queues launches (scene) and stops (`None`) at each track's quantize; starts the transport when
+/// it is stopped, so they begin at once. With `by_mode`, tracks set to Legato launch legato.
+fn launch(e: &mut Engine, changes: &[(TrackId, Option<usize>)], by_mode: bool) {
     if changes.iter().any(|(_, s)| s.is_some()) && !e.transport.playing && !e.transport_requests.contains(&TransportRequest::Play) {
         e.transport_requests.push(TransportRequest::Play);
     }
     for (track, scene) in changes {
-        e.launch_requests.push(LaunchRequest::Launch { track: *track, scene: *scene, quantize_bars });
+        let l = &e.session().launcher;
+        let quantize_bars = l.quantize_for(*track);
+        let legato = by_mode && scene.is_some() && l.mode_for(*track) == LaunchMode::Legato;
+        e.launch_requests.push(LaunchRequest::Launch { track: *track, scene: *scene, quantize_bars, legato });
     }
+}
+
+/// `launcher.track_launch`: a track's launch mode and quantize.
+fn track_launch(e: &mut Engine, p: &Value) -> Result<Value> {
+    const CMD: &str = "launcher.track_launch";
+    let t = track_param(e, CMD, p, "track")?.ok_or_else(|| bad(CMD, "`track` required"))?;
+    let mode = match p.get("mode") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_str().and_then(LaunchMode::from_id).ok_or_else(|| bad(CMD, "`mode` is \"restart\" or \"legato\""))?),
+    };
+    // "song" (or null) follows the launcher's quantize; a number of bars sets the track's own.
+    let quantize = match p.get("quantize") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("song") => Some(None),
+        Some(v) => {
+            Some(Some(v.as_f64().filter(|q| q.is_finite()).ok_or_else(|| bad(CMD, "`quantize` is \"song\" or bars (0 = none)"))?.clamp(0.0, 16.0)))
+        }
+    };
+    let row = e.session_mut().launcher.row_mut(t).ok_or_else(|| bad(CMD, "no such track"))?;
+    if let Some(m) = mode {
+        row.launch_mode = m;
+    }
+    if let Some(q) = quantize {
+        row.launch_quantize = q;
+    }
+    Ok(json!({"mode": row.launch_mode.id(), "quantize": row.launch_quantize}))
 }
 
 fn scene_param(e: &Engine, cmd: &str, p: &Value) -> Result<usize> {
@@ -353,11 +392,39 @@ mod tests {
         e.transport_requests.clear();
         e.execute("launcher.launch_scene", &json!({"scene": 0})).unwrap();
         assert_eq!(e.transport_requests, vec![crate::TransportRequest::Play]);
-        assert_eq!(e.launch_requests, vec![LaunchRequest::Launch { track: soundcraft_model::TrackId(kick), scene: Some(0), quantize_bars: 0.5 }]);
+        let t = soundcraft_model::TrackId(kick);
+        assert_eq!(e.launch_requests, vec![LaunchRequest::Launch { track: t, scene: Some(0), quantize_bars: 0.5, legato: false }]);
         // Launching is transport, not an edit: undo takes back the quantize change, not the launch.
         let before = e.session().launcher.clone();
         e.execute("edit.undo", &json!({})).unwrap();
         assert_ne!(e.session().launcher.quantize_bars, before.quantize_bars);
+    }
+
+    #[test]
+    fn tracks_launch_with_their_own_mode_and_quantize() {
+        let (mut e, kick) = engine();
+        let t = soundcraft_model::TrackId(kick);
+        e.execute("launcher.scene_add", &json!({})).unwrap();
+        let clip = e.session().track(t).unwrap().clips()[0].id.0;
+        e.execute("launcher.slot_from_clip", &json!({"clip": clip, "scene": 0})).unwrap();
+        let r = e.execute("launcher.track_launch", &json!({"track": kick, "mode": "legato", "quantize": 0.25})).unwrap();
+        assert_eq!(r, json!({"mode": "legato", "quantize": 0.25}));
+        e.launch_requests.clear();
+        e.execute("launcher.launch", &json!({"track": kick, "scene": 0})).unwrap();
+        assert_eq!(e.launch_requests, vec![LaunchRequest::Launch { track: t, scene: Some(0), quantize_bars: 0.25, legato: true }]);
+        // Scenes start from the top; stops are never legato.
+        e.launch_requests.clear();
+        e.execute("launcher.launch_scene", &json!({"scene": 0})).unwrap();
+        e.execute("launcher.stop", &json!({"track": kick})).unwrap();
+        let legato: Vec<bool> =
+            e.launch_requests.iter().filter_map(|r| if let LaunchRequest::Launch { legato, .. } = r { Some(*legato) } else { None }).collect();
+        assert_eq!(legato, vec![false, false]);
+        // "song" follows the launcher again; undo takes the settings back.
+        e.execute("launcher.track_launch", &json!({"track": kick, "quantize": "song"})).unwrap();
+        assert_eq!(e.session().launcher.quantize_for(t), 1.0);
+        e.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(e.session().launcher.quantize_for(t), 0.25);
+        assert!(e.execute("launcher.track_launch", &json!({"track": kick, "mode": "sideways"})).is_err());
     }
 
     /// The launched slot and the clips captured from it render the same samples.

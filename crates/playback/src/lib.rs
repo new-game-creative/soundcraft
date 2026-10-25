@@ -108,6 +108,8 @@ enum Cmd {
         track: TrackId,
         scene: Option<usize>,
         quantize_bars: f64,
+        /// Continue from the replaced slot's loop position.
+        legato: bool,
     },
     /// Tracks play their launched slots (on) or the timeline (off).
     SessionMode(bool),
@@ -311,8 +313,9 @@ struct AudioState {
     old_sessions: Option<SyncSender<Arc<Session>>>,
     /// Loudness of the main mix, sized to its channels (rebuilt only when the format changes).
     loudness: LoudnessMeter,
-    /// Launcher changes waiting for their quantise boundary: (track, scene or stop, sample).
-    launch_queue: Vec<(TrackId, Option<usize>, Samples)>,
+    /// Launcher changes waiting for their quantise boundary: (track, scene or stop, sample,
+    /// legato).
+    launch_queue: Vec<(TrackId, Option<usize>, Samples, bool)>,
     /// Takes recording inside the mix, fed after each block while recording.
     taps: Option<Arc<record::TapFeed>>,
     /// MIDI input names by device index.
@@ -450,9 +453,13 @@ impl AudioState {
     fn run_launch_queue(&mut self, n: usize) -> usize {
         let pos = self.pos;
         let mut i = 0;
-        while let Some(&(track, scene, at)) = self.launch_queue.get(i) {
+        while let Some(&(track, scene, at, legato)) = self.launch_queue.get(i) {
             if at <= pos {
-                self.mix.launch.set(track, scene, pos);
+                if legato {
+                    self.mix.launch.set_legato(track, scene, pos);
+                } else {
+                    self.mix.launch.set(track, scene, pos);
+                }
                 self.launch_queue.swap_remove(i);
             } else {
                 i += 1;
@@ -461,7 +468,7 @@ impl AudioState {
         // Every block, not only on changes: a publish that finds the UI holding the lock is
         // simply made again on the next one.
         self.publish_launch();
-        let next = self.launch_queue.iter().map(|(_, _, at)| *at).min();
+        let next = self.launch_queue.iter().map(|(_, _, at, _)| *at).min();
         next.map_or(n, |at| n.min(usize::try_from(at - pos).unwrap_or(n).max(1)))
     }
 
@@ -472,7 +479,7 @@ impl AudioState {
             st.playing.clear();
             st.playing.extend_from_slice(&self.mix.launch.playing);
             st.queued.clear();
-            st.queued.extend_from_slice(&self.launch_queue);
+            st.queued.extend(self.launch_queue.iter().map(|&(t, scene, at, _)| (t, scene, at)));
         }
     }
 
@@ -530,11 +537,11 @@ impl AudioState {
                     self.launch_queue.clear();
                     self.publish_launch();
                 }
-                Cmd::Launch { track, scene, quantize_bars } => {
+                Cmd::Launch { track, scene, quantize_bars, legato } => {
                     let at = self.launch_time(quantize_bars);
-                    self.launch_queue.retain(|(t, _, _)| *t != track);
+                    self.launch_queue.retain(|(t, _, _, _)| *t != track);
                     if self.launch_queue.len() < LAUNCH_CAPACITY {
-                        self.launch_queue.push((track, scene, at));
+                        self.launch_queue.push((track, scene, at, legato));
                     }
                     self.mix.launch.session_mode = true;
                     self.publish_launch();
@@ -548,7 +555,7 @@ impl AudioState {
                     self.publish_launch();
                 }
                 Cmd::Resume { track, scene, start } => {
-                    self.launch_queue.retain(|(t, _, _)| *t != track);
+                    self.launch_queue.retain(|(t, _, _, _)| *t != track);
                     self.mix.launch.set(track, Some(scene), start);
                     self.mix.launch.session_mode = true;
                     self.publish_launch();
@@ -1207,9 +1214,10 @@ impl Player {
     /// Launches `scene` on `track` (stops it with `None`) at the next multiple of `quantize_bars`
     /// bars, sample-accurately, and switches the tracks to their launched slots (session mode).
     /// Start the transport first if it is stopped: the launch then begins at once.
-    pub fn launch(&self, track: TrackId, scene: Option<usize>, quantize_bars: f64) {
+    /// With `legato`, a slot replacing one that plays continues from that slot's loop position.
+    pub fn launch(&self, track: TrackId, scene: Option<usize>, quantize_bars: f64, legato: bool) {
         let quantize_bars = if quantize_bars.is_finite() { quantize_bars.clamp(0.0, 16.0) } else { 1.0 };
-        let _ = self.tx.send(Cmd::Launch { track, scene, quantize_bars });
+        let _ = self.tx.send(Cmd::Launch { track, scene, quantize_bars, legato });
     }
 
     /// Plays `scene` on `track` straight away, as if launched at `start`: a loop picks up where
@@ -1679,6 +1687,65 @@ mod tests {
     }
 
     #[test]
+    fn a_legato_launch_continues_from_the_same_loop_position() {
+        use soundcraft_model::{ChannelFormat, Clip, LaunchSlot, SourceAudio, SourceId, TrackKind};
+        // 120 BPM 4/4 at 48 kHz: a beat is 24 000 samples, a bar 96 000. Slot A is a steady 0.5,
+        // slot B a ramp whose value tells where in its 1-bar loop it is playing.
+        let mut s = Session::default();
+        s.edit.click = false;
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let buf = |v: Vec<f32>| Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![v] }));
+        s.pool.insert(SourceId(5), buf(vec![0.5; 96_000]));
+        s.pool.insert(SourceId(6), buf((0..96_000).map(|i| i as f32 / 96_000.0).collect()));
+        s.launcher.insert_scene(0, "A".into());
+        s.launcher.insert_scene(1, "B".into());
+        for (scene, src) in [(0, 5), (1, 6)] {
+            let id = s.new_clip_id();
+            s.launcher.set_slot(t, scene, Some(LaunchSlot::new(Clip::audio(id, "loop", SourceId(src), 0, 0, 96_000), 3840))).unwrap();
+        }
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+            launch: Mutex::new(LaunchStatus::reserved()),
+            played: Mutex::new(Vec::with_capacity(PLAYED_CAPACITY)),
+            previewing: AtomicBool::new(false),
+        });
+        let (tx, rx) = channel();
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        let mut out = vec![0.0f32; 2 * 500];
+        let mut played = Vec::new();
+        let mut run_to = |st: &mut AudioState, played: &mut Vec<f32>, n: usize| {
+            while played.len() < n {
+                st.fill(&mut out, 2);
+                played.extend(out.iter().step_by(2).copied());
+            }
+        };
+        // A starts on bar 1 at once; B is launched legato 1.5 beats into it, on a 1/4 quantize.
+        tx.send(Cmd::Launch { track: t, scene: Some(0), quantize_bars: 0.0, legato: true }).unwrap();
+        run_to(&mut st, &mut played, 36_000);
+        tx.send(Cmd::Launch { track: t, scene: Some(1), quantize_bars: 0.25, legato: true }).unwrap();
+        run_to(&mut st, &mut played, 60_000);
+        // Levels relative to A's steady 0.5 (the track's pan law scales both alike).
+        let gain = played.get(47_999).copied().unwrap_or(0.0) / 0.5;
+        assert!(gain > 0.1, "A plays to the beat");
+        let at = |i: usize| played.get(i).copied().unwrap_or(f32::NAN) / gain;
+        assert!((at(47_000) - 0.5).abs() < 1e-4, "A is steady: {}", at(47_000));
+        // On beat 3 (sample 48 000) B takes over half way through its loop, not from the top.
+        assert!((at(48_000) - 0.5).abs() < 1e-3, "{}", at(48_000));
+        assert!((at(59_999) - 59_999.0 / 96_000.0).abs() < 1e-3);
+        let status = shared.launch.lock().unwrap().clone();
+        assert_eq!(status.playing, vec![(t, 1, 0)], "B keeps A's start reference");
+        // The same switch with Restart starts B from the top on the next beat.
+        tx.send(Cmd::Launch { track: t, scene: Some(0), quantize_bars: 0.25, legato: false }).unwrap();
+        run_to(&mut st, &mut played, 80_000);
+        assert!(played.get(72_000).is_some_and(|v| (v / gain - 0.5).abs() < 1e-4));
+        assert_eq!(shared.launch.lock().unwrap().playing, vec![(t, 0, 72_000)]);
+    }
+
+    #[test]
     fn a_launch_lands_exactly_on_the_next_quantise_boundary() {
         use soundcraft_model::{ChannelFormat, Clip, LaunchSlot, SourceAudio, SourceId, TrackKind};
         // 120 BPM 4/4 at 48 kHz: bar 2 starts at sample 96 000.
@@ -1709,7 +1776,7 @@ mod tests {
         st.fill(&mut out, 2);
         played.extend(out.iter().step_by(2).copied());
         // Launched a little into bar 1: queued for bar 2.
-        tx.send(Cmd::Launch { track: t, scene: Some(0), quantize_bars: 1.0 }).unwrap();
+        tx.send(Cmd::Launch { track: t, scene: Some(0), quantize_bars: 1.0, legato: false }).unwrap();
         st.fill(&mut out, 2);
         played.extend(out.iter().step_by(2).copied());
         let status = shared.launch.lock().unwrap().clone();

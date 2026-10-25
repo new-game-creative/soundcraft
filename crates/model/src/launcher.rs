@@ -51,6 +51,53 @@ pub struct LaunchRow {
     pub track: TrackId,
     #[serde(default)]
     pub slots: Vec<Option<LaunchSlot>>,
+    /// How a slot launched while another plays on this track starts.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub launch_mode: LaunchMode,
+    /// This track's launch quantize in bars (0 = at once); `None` follows
+    /// [`Launcher::quantize_bars`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_quantize: Option<f64>,
+}
+
+impl LaunchRow {
+    pub fn new(track: TrackId) -> Self {
+        LaunchRow { track, slots: Vec::new(), launch_mode: LaunchMode::default(), launch_quantize: None }
+    }
+
+    /// True when the row holds no slot and keeps the default launch settings.
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(Option::is_none) && self.launch_mode == LaunchMode::default() && self.launch_quantize.is_none()
+    }
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+
+/// How a slot starts when it replaces one already playing on its track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchMode {
+    /// From its beginning.
+    #[default]
+    Restart,
+    /// From where the playing slot is in its loop: the new slot takes over the old one's start
+    /// reference. Scene launches and launches on a stopped track still start from the top.
+    Legato,
+}
+
+impl LaunchMode {
+    pub fn id(self) -> &'static str {
+        match self {
+            LaunchMode::Restart => "restart",
+            LaunchMode::Legato => "legato",
+        }
+    }
+
+    pub fn from_id(s: &str) -> Option<LaunchMode> {
+        [LaunchMode::Restart, LaunchMode::Legato].into_iter().find(|m| m.id().eq_ignore_ascii_case(s))
+    }
 }
 
 /// A clip in a slot.
@@ -83,7 +130,29 @@ impl LaunchSlot {
 impl Launcher {
     /// True when there is nothing to save.
     pub fn is_empty(&self) -> bool {
-        self.scenes.is_empty() && self.rows.iter().all(|r| r.slots.iter().all(Option::is_none)) && self.quantize_bars == 1.0
+        self.scenes.is_empty() && self.rows.iter().all(LaunchRow::is_empty) && self.quantize_bars == 1.0
+    }
+
+    /// `track`'s row, added when missing.
+    pub fn row_mut(&mut self, track: TrackId) -> Option<&mut LaunchRow> {
+        match self.rows.iter().position(|r| r.track == track) {
+            Some(i) => self.rows.get_mut(i),
+            None => {
+                self.rows.push(LaunchRow::new(track));
+                self.rows.last_mut()
+            }
+        }
+    }
+
+    /// The quantize (bars, 0 = at once) a launch on `track` waits for: the track's own, else the
+    /// launcher's.
+    pub fn quantize_for(&self, track: TrackId) -> f64 {
+        self.row(track).and_then(|r| r.launch_quantize).unwrap_or(self.quantize_bars)
+    }
+
+    /// How a slot launched on `track` starts.
+    pub fn mode_for(&self, track: TrackId) -> LaunchMode {
+        self.row(track).map(|r| r.launch_mode).unwrap_or_default()
     }
 
     pub fn row(&self, track: TrackId) -> Option<&LaunchRow> {
@@ -104,13 +173,7 @@ impl Launcher {
         if scene >= self.scenes.len() {
             return None;
         }
-        let row = match self.rows.iter().position(|r| r.track == track) {
-            Some(i) => self.rows.get_mut(i)?,
-            None => {
-                self.rows.push(LaunchRow { track, slots: Vec::new() });
-                self.rows.last_mut()?
-            }
-        };
+        let row = self.row_mut(track)?;
         if row.slots.len() <= scene {
             row.slots.resize(scene + 1, None);
         }
@@ -175,6 +238,7 @@ impl Launcher {
                     *s = None;
                 }
             }
+            r.launch_quantize = r.launch_quantize.filter(|q| q.is_finite()).map(|q| q.clamp(0.0, 16.0));
         }
         self.quantize_bars = if self.quantize_bars.is_finite() { self.quantize_bars.clamp(0.0, 16.0) } else { 1.0 };
     }
@@ -213,7 +277,10 @@ mod tests {
         l.insert_scene(0, "A".into());
         l.set_slot(TrackId(1), 0, Some(LaunchSlot::new(clip(9), 3840))).unwrap();
         l.set_slot(TrackId(2), 0, Some(LaunchSlot::new(clip(10), 3840))).unwrap();
-        l.rows.push(LaunchRow { track: TrackId(1), slots: vec![None, None, None] });
+        l.rows.push(LaunchRow { slots: vec![None, None, None], ..LaunchRow::new(TrackId(1)) });
+        if let Some(r) = l.rows.first_mut() {
+            r.launch_quantize = Some(f64::INFINITY);
+        }
         if let Some(s) = l.slot_mut(TrackId(1), 0) {
             s.loop_ticks = -5;
             s.clip.start = 777;
@@ -224,6 +291,27 @@ mod tests {
         let s = l.slot(TrackId(1), 0).unwrap();
         assert_eq!((s.clip.start, s.loop_ticks), (0, TPQ / 4));
         assert_eq!(l.quantize_bars, 1.0);
+        assert_eq!(l.rows[0].launch_quantize, None, "a bad track quantize follows the launcher's");
+    }
+
+    #[test]
+    fn tracks_keep_their_own_launch_settings() {
+        let mut l = Launcher::default();
+        assert_eq!((l.quantize_for(TrackId(1)), l.mode_for(TrackId(1))), (1.0, LaunchMode::Restart));
+        if let Some(r) = l.row_mut(TrackId(1)) {
+            r.launch_mode = LaunchMode::Legato;
+            r.launch_quantize = Some(0.25);
+        }
+        assert!(!l.is_empty(), "a track's launch settings are saved");
+        assert_eq!((l.quantize_for(TrackId(1)), l.mode_for(TrackId(1))), (0.25, LaunchMode::Legato));
+        assert_eq!(l.quantize_for(TrackId(2)), 1.0);
+        let mut s = crate::Session::default();
+        let t = s.add_track(crate::TrackKind::Audio, crate::ChannelFormat::Mono, None);
+        s.launcher = l.clone();
+        s.launcher.rows[0].track = t;
+        let back = crate::Session::from_json(&s.to_json().unwrap()).unwrap();
+        assert_eq!(back.launcher, s.launcher);
+        assert_eq!(LaunchMode::from_id("LEGATO"), Some(LaunchMode::Legato));
     }
 
     #[test]

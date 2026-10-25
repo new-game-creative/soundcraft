@@ -1494,12 +1494,19 @@ mod click {
                 break;
             }
             if at.saturating_add(len) > pos {
-                let (hz, vel) = if s.tempo.bar_beat_at_tick(tick).beat == 1 { accent } else { normal };
+                let (hz, vel) = if accented(s.tempo.meter_at_tick(tick), s.tempo.bar_beat_at_tick(tick).beat) { accent } else { normal };
                 let amp = gain * (vel.clamp(1.0, 127.0) / 127.0);
                 blip(main, at - pos, frames, hz, amp as f32, rate);
             }
             tick = tick.saturating_add(s.tempo.meter_at_tick(tick).ticks_per_beat());
         }
+    }
+
+    /// Whether `beat` (1-based) of a bar in `meter` is accented: beat 1, and in compound meters
+    /// (6/8, 9/8, 12/8) the first beat of every group of three.
+    pub(crate) fn accented(meter: soundcraft_time::MeterEvent, beat: i64) -> bool {
+        let compound = meter.denominator == 8 && meter.numerator > 3 && meter.numerator.is_multiple_of(3);
+        beat == 1 || (compound && (beat - 1).rem_euclid(3) == 0)
     }
 
     /// Adds one decaying sine blip whose first sample sits `rel` frames into the block (negative
@@ -3439,6 +3446,26 @@ mod tests {
         // Blocks that start mid-beat render the same clicks as a single pass.
         let split = render_playback(&s, len, 97, false);
         assert_eq!(out, split);
+    }
+
+    #[test]
+    fn compound_meters_accent_each_group_of_three() {
+        let m = |n, d| soundcraft_time::MeterEvent { tick: 0, numerator: n, denominator: d };
+        let accents = |n, d| (1..=n as i64).filter(|b| click::accented(m(n, d), *b)).collect::<Vec<_>>();
+        assert_eq!(accents(4, 4), vec![1]);
+        assert_eq!(accents(3, 4), vec![1]);
+        assert_eq!(accents(6, 8), vec![1, 4]);
+        assert_eq!(accents(12, 8), vec![1, 4, 7, 10]);
+        assert_eq!(accents(7, 8), vec![1]);
+        // And in the audio: in 6/8, beat 4 clicks as loud as beat 1, louder than beat 2.
+        let mut s = Session::default();
+        s.tempo.set_meter(0, 6, 8).unwrap();
+        s.edit.click = true;
+        let beat = s.tempo.tick_to_samples(s.tempo.meter_at_tick(0).ticks_per_beat(), s.sample_rate) as usize;
+        let out = render_playback(&s, beat * 6, 512, false);
+        let peak = |b: usize| out[0][b * beat..b * beat + 200].iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!((peak(3) - peak(0)).abs() < 1e-3, "{} vs {}", peak(3), peak(0));
+        assert!(peak(3) > peak(1) * 1.1, "{} vs {}", peak(3), peak(1));
     }
 
     #[test]

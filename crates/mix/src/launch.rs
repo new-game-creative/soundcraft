@@ -28,6 +28,13 @@ impl LaunchPlayback {
             self.playing.push((track, scene, at));
         }
     }
+
+    /// Like [`LaunchPlayback::set`], but a slot replacing one that plays takes over its start, so
+    /// it continues from the same loop position (legato). A stopped track starts at `at`.
+    pub fn set_legato(&mut self, track: TrackId, scene: Option<usize>, at: Samples) {
+        let start = self.playing(track).filter(|_| scene.is_some()).map_or(at, |(_, start)| start);
+        self.set(track, scene, start);
+    }
 }
 
 /// The loop pass of a slot launched at `start` that contains sample `at`: its first sample and
